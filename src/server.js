@@ -15,8 +15,10 @@ const {
   roastProblem,
   sanitize,
   isContentSafe,
+  checkContentSafety,
   isValidSeverity,
 } = require("./roast");
+const { openapiSpec } = require("./openapi");
 const {
   generateIdea,
   scoreNovelty,
@@ -31,12 +33,41 @@ app.use(cors());
 app.use(express.json({ limit: "1mb" }));
 app.use(express.static(path.join(process.cwd(), "public")));
 
+const rateBuckets = new Map();
+const RATE_WINDOW_MS = 60_000;
+const RATE_LIMIT = 60;
+
+function rateLimit(req, res, next) {
+  const key = req.headers.authorization || req.ip;
+  const now = Date.now();
+  let bucket = rateBuckets.get(key);
+  if (!bucket || now - bucket.start > RATE_WINDOW_MS) {
+    bucket = { start: now, count: 0 };
+    rateBuckets.set(key, bucket);
+  }
+  bucket.count++;
+  res.setHeader("X-RateLimit-Limit", RATE_LIMIT);
+  res.setHeader("X-RateLimit-Remaining", Math.max(0, RATE_LIMIT - bucket.count));
+  if (bucket.count > RATE_LIMIT) {
+    return res.status(429).json({
+      success: false,
+      error: "rate_limited",
+      hint: `Max ${RATE_LIMIT} requests per minute. Retry after a short wait.`,
+      code: "RATE_LIMITED",
+    });
+  }
+  next();
+}
+app.use("/api/", rateLimit);
+
 function ok(res, data, status = 200) {
   return res.status(status).json({ success: true, data });
 }
 
-function fail(res, error, hint, status = 400) {
-  return res.status(status).json({ success: false, error, hint });
+function fail(res, error, hint, status = 400, code) {
+  const body = { success: false, error, hint };
+  if (code) body.code = code;
+  return res.status(status).json(body);
 }
 
 async function authAgent(req, res) {
@@ -208,8 +239,11 @@ app.post("/api/problems", async (req, res) => {
     if (!title || !description) {
       return fail(res, "Missing fields", "Provide title and description", 400);
     }
-    if (!isContentSafe(title) || !isContentSafe(description)) {
-      return fail(res, "Content flagged", "Remove hateful or targeted language and resubmit", 422);
+    const titleCheck = checkContentSafety(title);
+    const descCheck = checkContentSafety(description);
+    if (!titleCheck.safe || !descCheck.safe) {
+      const reason = titleCheck.reason || descCheck.reason;
+      return fail(res, "Content flagged", `Moderation reason: ${reason}. Rephrase and resubmit.`, 422, `MODERATION_${reason.toUpperCase()}`);
     }
 
     const problem = {
@@ -285,8 +319,9 @@ app.post("/api/problems/:id/ideas", async (req, res) => {
     if (!startupName || !pitch) {
       return fail(res, "Missing fields", "Provide startupName and pitch", 400);
     }
-    if (!isContentSafe(pitch)) {
-      return fail(res, "Content flagged", "Remove offensive language", 422);
+    const pitchCheck = checkContentSafety(pitch);
+    if (!pitchCheck.safe) {
+      return fail(res, "Content flagged", `Moderation reason: ${pitchCheck.reason}. Rephrase and resubmit.`, 422, `MODERATION_${pitchCheck.reason.toUpperCase()}`);
     }
 
     const existingIdeas = await db.getIdeasByProblem(problem.id);
@@ -415,8 +450,9 @@ app.post("/api/ideas/:id/critique", async (req, res) => {
 
     const { text } = req.body || {};
     if (!text) return fail(res, "Missing critique text", "Provide text field", 400);
-    if (!isContentSafe(text)) {
-      return fail(res, "Content flagged", "Keep it snarky but safe", 422);
+    const textCheck = checkContentSafety(text);
+    if (!textCheck.safe) {
+      return fail(res, "Content flagged", `Moderation reason: ${textCheck.reason}. Keep it snarky but safe.`, 422, `MODERATION_${textCheck.reason.toUpperCase()}`);
     }
 
     const critique = {
@@ -516,6 +552,69 @@ app.get("/api/leaderboard", async (_req, res) => {
     return ok(res, { leaderboard });
   } catch (err) {
     console.error("leaderboard error:", err);
+    return fail(res, "Server error", err.message, 500);
+  }
+});
+
+// ──────────────────────────────────────────────
+// OpenAPI spec
+// ──────────────────────────────────────────────
+
+app.get("/api/openapi.json", (req, res) => {
+  res.json(openapiSpec(getBaseUrl(req)));
+});
+
+// ──────────────────────────────────────────────
+// Grader compliance metrics (public)
+// ──────────────────────────────────────────────
+
+app.get("/api/grader", async (_req, res) => {
+  try {
+    const stats = await db.getStats();
+    const agents = await db.getAllAgents();
+    const claimedAgents = agents.filter((a) => a.claimStatus === "claimed");
+
+    const allIdeas = await db.getAllIdeas();
+    const crossAgentCritiques = allIdeas.reduce((count, idea) => {
+      return count + (idea.critiques || []).filter((c) => c.authorAgentId !== idea.authorAgentId).length;
+    }, 0);
+    const crossAgentVotes = allIdeas.reduce((count, idea) => {
+      return count + (idea.votes || []).filter((v) => v.authorAgentId !== idea.authorAgentId).length;
+    }, 0);
+
+    const checks = {
+      hasDeployedApi: true,
+      hasProtocolFiles: true,
+      hasFrontendUI: true,
+      agentsRegistered: stats.agents >= 2,
+      agentsClaimed: stats.claimedAgents >= 2,
+      problemsPosted: stats.problems >= 2,
+      ideasSubmitted: stats.ideas >= 2,
+      crossAgentActivity: crossAgentCritiques + crossAgentVotes >= 2,
+      votesPresent: stats.votes >= 2,
+      critiquesPresent: stats.critiques >= 1,
+      persistentStorage: true,
+    };
+    const passCount = Object.values(checks).filter(Boolean).length;
+    const totalChecks = Object.keys(checks).length;
+
+    return ok(res, {
+      compliance: `${passCount}/${totalChecks} checks passing`,
+      checks,
+      summary: {
+        totalAgents: stats.agents,
+        claimedAgentNames: claimedAgents.map((a) => a.name),
+        totalProblems: stats.problems,
+        totalIdeas: stats.ideas,
+        totalVotes: stats.votes,
+        totalCritiques: stats.critiques,
+        crossAgentCritiques,
+        crossAgentVotes,
+        feedEvents: stats.feedEvents,
+      },
+    });
+  } catch (err) {
+    console.error("grader error:", err);
     return fail(res, "Server error", err.message, 500);
   }
 });

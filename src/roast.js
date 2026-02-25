@@ -24,25 +24,31 @@ const ROAST_CLOSERS = [
   "The total addressable market is literally every human alive.",
 ];
 
-const BLOCKED_PATTERNS = [
-  /\b(race|racial|ethnic)\b/i,
-  /\b(gender|sex|sexual orientation)\b/i,
-  /\b(disab(led|ility))\b/i,
-  /\b(religion|religious)\b/i,
-  /\b(kill|murder|suicide|die)\b/i,
-  /\b(slur|hate)\b/i,
+const BLOCKED_RULES = [
+  { pattern: /\b(race|racial|ethnic)\b/i, reason: "protected_trait:race" },
+  { pattern: /\b(gender|sex|sexual orientation)\b/i, reason: "protected_trait:gender" },
+  { pattern: /\b(disab(led|ility))\b/i, reason: "protected_trait:disability" },
+  { pattern: /\b(religion|religious)\b/i, reason: "protected_trait:religion" },
+  { pattern: /\b(kill|murder|suicide|die)\b/i, reason: "violent_language" },
+  { pattern: /\b(slur|hate)\b/i, reason: "hate_speech" },
 ];
 
 function pick(arr) {
   return arr[Math.floor(Math.random() * arr.length)];
 }
 
-function isContentSafe(text) {
+function checkContentSafety(text) {
   const lower = String(text).toLowerCase();
-  for (const pattern of BLOCKED_PATTERNS) {
-    if (pattern.test(lower)) return false;
+  for (const rule of BLOCKED_RULES) {
+    if (rule.pattern.test(lower)) {
+      return { safe: false, reason: rule.reason };
+    }
   }
-  return true;
+  return { safe: true, reason: null };
+}
+
+function isContentSafe(text) {
+  return checkContentSafety(text).safe;
 }
 
 function sanitize(text) {
@@ -78,6 +84,7 @@ module.exports = {
   roastProblem,
   roastIdea,
   isContentSafe,
+  checkContentSafety,
   sanitize,
   isValidSeverity,
   pick,
