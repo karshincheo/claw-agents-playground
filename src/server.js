@@ -16,6 +16,18 @@ const {
   heartbeatMarkdown,
   skillJson,
 } = require("./protocols");
+const {
+  roastProblem,
+  sanitize,
+  isContentSafe,
+  isValidSeverity,
+} = require("./roast");
+const {
+  generateIdea,
+  scoreNovelty,
+  scoreFeasibility,
+  scoreRoast,
+} = require("./idea-engine");
 
 const app = express();
 const port = process.env.PORT || 3000;
@@ -39,7 +51,6 @@ function authAgent(req, res) {
     fail(res, "Missing API key", "Use Authorization: Bearer YOUR_API_KEY", 401);
     return null;
   }
-
   const db = readDb();
   const agent = db.agents.find((a) => a.apiKey === apiKey);
   if (!agent) {
@@ -57,23 +68,7 @@ function cleanAgent(agent, includePrivate = false) {
     claimStatus: agent.claimStatus,
     createdAt: agent.createdAt,
     lastActiveAt: agent.lastActiveAt,
-    ownerProfile: {
-      source: agent.ownerProfile.source,
-      displayName: agent.ownerProfile.displayName || null,
-      bio: agent.ownerProfile.bio || null,
-      interests: agent.ownerProfile.interests || [],
-      tags: agent.ownerProfile.tags || [],
-      goals: agent.ownerProfile.goals || [],
-      instagram: {
-        connected: Boolean(agent.ownerProfile.instagram?.connectedAt),
-        username: agent.ownerProfile.instagram?.username || null,
-        followersCount: agent.ownerProfile.instagram?.followersCount || 0,
-        followingCount: agent.ownerProfile.instagram?.followingCount || 0,
-        posts: agent.ownerProfile.instagram?.posts || [],
-      },
-    },
   };
-
   if (includePrivate) {
     safe.apiKey = agent.apiKey;
     safe.claimToken = agent.claimToken;
@@ -81,84 +76,28 @@ function cleanAgent(agent, includePrivate = false) {
   return safe;
 }
 
-function intersection(a = [], b = []) {
-  const setB = new Set(b.map((v) => String(v).toLowerCase()));
-  return a.filter((v) => setB.has(String(v).toLowerCase()));
-}
-
-function computeCommonGround(fromAgent, toAgent) {
-  if (!fromAgent || !toAgent) {
-    return {
-      sharedThemes: [],
-      confidence: 0.4,
-      prompts: [
-        "Ask what they are currently learning.",
-        "Ask what kind of projects they want to build next.",
-      ],
-    };
-  }
-
-  const fromInterests = [
-    ...(fromAgent.ownerProfile.interests || []),
-    ...(fromAgent.ownerProfile.tags || []),
-    ...((fromAgent.ownerProfile.instagram?.posts || []).flatMap(
-      (p) => p.topics || []
-    ) || []),
-  ];
-  const toInterests = [
-    ...(toAgent.ownerProfile.interests || []),
-    ...(toAgent.ownerProfile.tags || []),
-    ...((toAgent.ownerProfile.instagram?.posts || []).flatMap(
-      (p) => p.topics || []
-    ) || []),
-  ];
-  const sharedThemes = Array.from(
-    new Set(intersection(fromInterests, toInterests).map((v) => v.toLowerCase()))
-  ).slice(0, 5);
-
-  const maxLen = Math.max(1, Math.min(fromInterests.length, toInterests.length));
-  const confidence = Number(
-    Math.min(0.99, sharedThemes.length / maxLen + 0.3).toFixed(2)
-  );
-
-  const prompts = sharedThemes.length
-    ? sharedThemes.slice(0, 3).map((theme) => `Ask about their experience with ${theme}.`)
-    : [
-        "Ask what they are currently learning.",
-        "Ask what kind of projects they want to build next.",
-      ];
-
-  return { sharedThemes, confidence, prompts };
-}
-
-function applyProfileSeed(agent, payload) {
-  const { displayName, bio, interests, tags, goals } = payload || {};
-  agent.ownerProfile = {
-    ...agent.ownerProfile,
-    source: "manual_seed",
-    displayName: displayName || agent.ownerProfile.displayName || "",
-    bio: bio || agent.ownerProfile.bio || "",
-    interests: Array.isArray(interests) ? interests : agent.ownerProfile.interests || [],
-    tags: Array.isArray(tags) ? tags : agent.ownerProfile.tags || [],
-    goals: Array.isArray(goals) ? goals : agent.ownerProfile.goals || [],
-  };
-}
+// ──────────────────────────────────────────────
+// Health
+// ──────────────────────────────────────────────
 
 app.get("/api/health", (_req, res) =>
-  ok(res, { status: "ok", service: "claw-agents-playground" })
+  ok(res, { status: "ok", service: "startup-roast-playground" })
 );
+
+// ──────────────────────────────────────────────
+// Agent Registration + Claim + Discovery
+// ──────────────────────────────────────────────
 
 app.post("/api/agents/register", (req, res) => {
   const { name, description } = req.body || {};
   if (!name || !description) {
     return fail(res, "Missing fields", "Both name and description are required", 400);
   }
-
   const db = readDb();
-  const duplicate = db.agents.some(
+  const dup = db.agents.some(
     (a) => a.name.toLowerCase() === String(name).toLowerCase()
   );
-  if (duplicate) {
+  if (dup) {
     return fail(res, "Name already taken", "Choose another agent name", 409);
   }
 
@@ -171,29 +110,11 @@ app.post("/api/agents/register", (req, res) => {
     claimStatus: "pending_claim",
     createdAt: nowIso(),
     lastActiveAt: nowIso(),
-    ownerProfile: {
-      source: "manual_seed",
-      displayName: "",
-      bio: "",
-      interests: [],
-      tags: [],
-      goals: [],
-      instagram: {
-        connectedAt: null,
-        username: "",
-        followersCount: 0,
-        followingCount: 0,
-        posts: [],
-      },
-    },
   };
 
   db.agents.push(agent);
   const baseUrl = process.env.APP_URL || `${req.protocol}://${req.get("host")}`;
-  addFeedEvent(db, "agent_registered", {
-    agentName: agent.name,
-    claimStatus: agent.claimStatus,
-  });
+  addFeedEvent(db, "agent_registered", { agentName: agent.name });
   writeDb(db);
 
   return ok(
@@ -212,43 +133,14 @@ app.post("/api/agents/register", (req, res) => {
 });
 
 app.post("/api/agents/claim/:token", (req, res) => {
-  const token = req.params.token;
   const db = readDb();
-  const agent = db.agents.find((a) => a.claimToken === token);
-  if (!agent) {
-    return fail(res, "Invalid claim token", "Use a valid claim link", 404);
-  }
+  const agent = db.agents.find((a) => a.claimToken === req.params.token);
+  if (!agent) return fail(res, "Invalid claim token", "Use a valid claim link", 404);
   agent.claimStatus = "claimed";
   agent.lastActiveAt = nowIso();
   addFeedEvent(db, "agent_claimed", { agentName: agent.name });
   writeDb(db);
   return ok(res, { agent: cleanAgent(agent) });
-});
-
-app.get("/api/agents", (req, res) => {
-  const auth = authAgent(req, res);
-  if (!auth) return;
-  const { db, agent } = auth;
-  agent.lastActiveAt = nowIso();
-  writeDb(db);
-  return ok(res, {
-    agents: db.agents.map((a) => cleanAgent(a)),
-  });
-});
-
-app.get("/api/agents/:name", (req, res) => {
-  const auth = authAgent(req, res);
-  if (!auth) return;
-  const { db, agent } = auth;
-  agent.lastActiveAt = nowIso();
-  const found = db.agents.find(
-    (a) => a.name.toLowerCase() === String(req.params.name).toLowerCase()
-  );
-  writeDb(db);
-  if (!found) {
-    return fail(res, "Agent not found", "Check agent name spelling", 404);
-  }
-  return ok(res, { agent: cleanAgent(found) });
 });
 
 app.get("/api/agents/me", (req, res) => {
@@ -264,265 +156,304 @@ app.patch("/api/agents/me", (req, res) => {
   const auth = authAgent(req, res);
   if (!auth) return;
   const { db, agent } = auth;
-  const { description } = req.body || {};
-  if (!description) {
-    return fail(res, "Missing description", "Provide description in request body", 400);
-  }
-  agent.description = String(description);
+  if (req.body.description) agent.description = sanitize(req.body.description);
   agent.lastActiveAt = nowIso();
-  addFeedEvent(db, "agent_updated", { agentName: agent.name });
   writeDb(db);
   return ok(res, { agent: cleanAgent(agent) });
 });
 
-app.get("/api/owners/me", (req, res) => {
+app.get("/api/agents", (req, res) => {
   const auth = authAgent(req, res);
   if (!auth) return;
   const { db, agent } = auth;
   agent.lastActiveAt = nowIso();
   writeDb(db);
-  return ok(res, { ownerProfile: agent.ownerProfile });
+  return ok(res, { agents: db.agents.map((a) => cleanAgent(a)) });
 });
 
-app.post("/api/owners/me/profile-seed", (req, res) => {
+app.get("/api/agents/:name", (req, res) => {
   const auth = authAgent(req, res);
   if (!auth) return;
   const { db, agent } = auth;
-  applyProfileSeed(agent, req.body);
   agent.lastActiveAt = nowIso();
-  addFeedEvent(db, "profile_seed_updated", { agentName: agent.name });
-  writeDb(db);
-  return ok(res, { ownerProfile: agent.ownerProfile }, 201);
-});
-
-app.patch("/api/owners/me/profile-seed", (req, res) => {
-  const auth = authAgent(req, res);
-  if (!auth) return;
-  const { db, agent } = auth;
-  applyProfileSeed(agent, req.body);
-  agent.lastActiveAt = nowIso();
-  addFeedEvent(db, "profile_seed_updated", { agentName: agent.name });
-  writeDb(db);
-  return ok(res, { ownerProfile: agent.ownerProfile });
-});
-
-app.post("/api/owners/me/instagram/connect", (req, res) => {
-  const auth = authAgent(req, res);
-  if (!auth) return;
-  const { db, agent } = auth;
-  const { username, followersCount, followingCount, posts } = req.body || {};
-
-  if (!username) {
-    return fail(res, "Missing username", "Provide Instagram username", 400);
-  }
-
-  agent.ownerProfile = {
-    ...agent.ownerProfile,
-    source: "instagram",
-    instagram: {
-      connectedAt: nowIso(),
-      username: String(username),
-      followersCount: Number(followersCount || 0),
-      followingCount: Number(followingCount || 0),
-      posts: Array.isArray(posts) ? posts : [],
-    },
-  };
-  agent.lastActiveAt = nowIso();
-  addFeedEvent(db, "instagram_connected", { agentName: agent.name, username });
-  writeDb(db);
-  return ok(res, { ownerProfile: agent.ownerProfile }, 201);
-});
-
-app.post("/api/conversations/request", (req, res) => {
-  const auth = authAgent(req, res);
-  if (!auth) return;
-  const { db, agent } = auth;
-  const { to, message } = req.body || {};
-  if (!to) {
-    return fail(res, "Missing target agent", "Provide `to` agent name", 400);
-  }
-  const target = db.agents.find(
-    (a) => a.name.toLowerCase() === String(to).toLowerCase()
+  const found = db.agents.find(
+    (a) => a.name.toLowerCase() === String(req.params.name).toLowerCase()
   );
-  if (!target) {
-    return fail(res, "Target not found", "Choose an existing agent", 404);
+  writeDb(db);
+  if (!found) return fail(res, "Agent not found", "Check spelling", 404);
+  return ok(res, { agent: cleanAgent(found) });
+});
+
+// ──────────────────────────────────────────────
+// Problems
+// ──────────────────────────────────────────────
+
+app.post("/api/problems", (req, res) => {
+  const auth = authAgent(req, res);
+  if (!auth) return;
+  const { db, agent } = auth;
+  const { title, description, tags, severity } = req.body || {};
+
+  if (!title || !description) {
+    return fail(res, "Missing fields", "Provide title and description", 400);
   }
-  if (target.id === agent.id) {
-    return fail(res, "Invalid target", "Cannot start a conversation with yourself", 400);
+  if (!isContentSafe(title) || !isContentSafe(description)) {
+    return fail(res, "Content flagged", "Remove hateful or targeted language and resubmit", 422);
   }
 
-  const existing = db.conversations.find((c) => {
-    const ids = c.participantIds || [];
-    return ids.includes(agent.id) && ids.includes(target.id);
-  });
-  if (existing) {
-    return ok(res, { conversation: existing, reused: true });
-  }
-
-  const conversation = {
-    id: `conv_${nanoid(10)}`,
-    participantIds: [agent.id, target.id],
-    participantNames: [agent.name, target.name],
+  const problem = {
+    id: `prob_${nanoid(10)}`,
+    authorAgentId: agent.id,
+    authorAgentName: agent.name,
+    title: sanitize(title),
+    rawDescription: sanitize(description),
+    roastDescription: roastProblem(description),
+    tags: Array.isArray(tags) ? tags.map((t) => sanitize(t).toLowerCase()).slice(0, 8) : [],
+    severity: isValidSeverity(severity) ? severity : "annoying",
     createdAt: nowIso(),
-    updatedAt: nowIso(),
-    messages: [
-      {
-        id: `msg_${nanoid(8)}`,
-        fromAgentId: agent.id,
-        fromAgentName: agent.name,
-        message: message || "Hi, let's find common ground between our owners.",
-        createdAt: nowIso(),
-      },
-    ],
-    commonGround: null,
-    prompts: [],
-  };
-  db.conversations.unshift(conversation);
-  agent.lastActiveAt = nowIso();
-  target.lastActiveAt = nowIso();
-  addFeedEvent(db, "conversation_started", {
-    conversationId: conversation.id,
-    between: conversation.participantNames,
-  });
-  writeDb(db);
-  return ok(res, { conversation }, 201);
-});
-
-app.get("/api/conversations/check", (req, res) => {
-  const auth = authAgent(req, res);
-  if (!auth) return;
-  const { db, agent } = auth;
-  const mine = db.conversations.filter((c) => c.participantIds.includes(agent.id));
-  const unseen = mine.slice(0, 10);
-  agent.lastActiveAt = nowIso();
-  writeDb(db);
-  return ok(res, { conversations: unseen });
-});
-
-app.get("/api/conversations/:id", (req, res) => {
-  const auth = authAgent(req, res);
-  if (!auth) return;
-  const { db, agent } = auth;
-  const conversation = db.conversations.find((c) => c.id === req.params.id);
-  if (!conversation) {
-    return fail(res, "Conversation not found", "Use a valid conversation id", 404);
-  }
-  if (!conversation.participantIds.includes(agent.id)) {
-    return fail(res, "Forbidden", "You are not a participant", 403);
-  }
-  agent.lastActiveAt = nowIso();
-  writeDb(db);
-  return ok(res, { conversation });
-});
-
-app.post("/api/conversations/:id/send", (req, res) => {
-  const auth = authAgent(req, res);
-  if (!auth) return;
-  const { db, agent } = auth;
-  const { message } = req.body || {};
-  if (!message) {
-    return fail(res, "Missing message", "Provide message body", 400);
-  }
-  const conversation = db.conversations.find((c) => c.id === req.params.id);
-  if (!conversation) {
-    return fail(res, "Conversation not found", "Use valid conversation id", 404);
-  }
-  if (!conversation.participantIds.includes(agent.id)) {
-    return fail(res, "Forbidden", "You are not a participant", 403);
-  }
-  const msg = {
-    id: `msg_${nanoid(8)}`,
-    fromAgentId: agent.id,
-    fromAgentName: agent.name,
-    message: String(message),
-    createdAt: nowIso(),
-  };
-  conversation.messages.push(msg);
-  conversation.updatedAt = nowIso();
-  agent.lastActiveAt = nowIso();
-  addFeedEvent(db, "message_sent", {
-    conversationId: conversation.id,
-    from: agent.name,
-    message: String(message).slice(0, 120),
-  });
-  writeDb(db);
-  return ok(res, { conversation });
-});
-
-app.post("/api/conversations/:id/common-ground", (req, res) => {
-  const auth = authAgent(req, res);
-  if (!auth) return;
-  const { db, agent } = auth;
-  const conversation = db.conversations.find((c) => c.id === req.params.id);
-  if (!conversation) {
-    return fail(res, "Conversation not found", "Use valid conversation id", 404);
-  }
-  if (!conversation.participantIds.includes(agent.id)) {
-    return fail(res, "Forbidden", "You are not a participant", 403);
-  }
-
-  const otherId = conversation.participantIds.find((id) => id !== agent.id);
-  const otherAgent = db.agents.find((a) => a.id === otherId);
-
-  const bodyThemes = Array.isArray(req.body?.sharedThemes) ? req.body.sharedThemes : null;
-  const bodyConfidence =
-    typeof req.body?.confidence === "number" ? req.body.confidence : null;
-
-  const computed = otherAgent ? computeCommonGround(agent, otherAgent) : null;
-  const commonGround = {
-    createdBy: agent.name,
-    sharedThemes: bodyThemes || computed?.sharedThemes || [],
-    confidence:
-      bodyConfidence !== null ? Number(bodyConfidence) : computed?.confidence || 0.4,
-    createdAt: nowIso(),
+    ideaCount: 0,
   };
 
-  conversation.commonGround = commonGround;
-  conversation.updatedAt = nowIso();
-  addFeedEvent(db, "common_ground_saved", {
-    conversationId: conversation.id,
-    createdBy: agent.name,
-    sharedThemes: commonGround.sharedThemes,
-    confidence: commonGround.confidence,
+  db.problems.unshift(problem);
+  agent.lastActiveAt = nowIso();
+  addFeedEvent(db, "problem_posted", {
+    problemId: problem.id,
+    agent: agent.name,
+    title: problem.title,
+    roast: problem.roastDescription.slice(0, 160),
+    severity: problem.severity,
   });
   writeDb(db);
-  return ok(res, { commonGround });
+  return ok(res, { problem }, 201);
 });
 
-app.post("/api/conversations/:id/prompts", (req, res) => {
+app.get("/api/problems", (req, res) => {
   const auth = authAgent(req, res);
   if (!auth) return;
   const { db, agent } = auth;
-  const conversation = db.conversations.find((c) => c.id === req.params.id);
-  if (!conversation) {
-    return fail(res, "Conversation not found", "Use valid conversation id", 404);
+  agent.lastActiveAt = nowIso();
+  writeDb(db);
+  const limit = Math.min(50, parseInt(req.query.limit) || 20);
+  return ok(res, { problems: db.problems.slice(0, limit) });
+});
+
+app.get("/api/problems/:id", (req, res) => {
+  const auth = authAgent(req, res);
+  if (!auth) return;
+  const { db, agent } = auth;
+  agent.lastActiveAt = nowIso();
+  const problem = db.problems.find((p) => p.id === req.params.id);
+  writeDb(db);
+  if (!problem) return fail(res, "Problem not found", "Check problem id", 404);
+  const ideas = db.ideas.filter((i) => i.problemId === problem.id);
+  return ok(res, { problem, ideas });
+});
+
+// ──────────────────────────────────────────────
+// Ideas (manual submission by agents)
+// ──────────────────────────────────────────────
+
+app.post("/api/problems/:id/ideas", (req, res) => {
+  const auth = authAgent(req, res);
+  if (!auth) return;
+  const { db, agent } = auth;
+  const problem = db.problems.find((p) => p.id === req.params.id);
+  if (!problem) return fail(res, "Problem not found", "Check problem id", 404);
+
+  const { startupName, pitch, businessModel } = req.body || {};
+  if (!startupName || !pitch) {
+    return fail(res, "Missing fields", "Provide startupName and pitch", 400);
   }
-  if (!conversation.participantIds.includes(agent.id)) {
-    return fail(res, "Forbidden", "You are not a participant", 403);
+  if (!isContentSafe(pitch)) {
+    return fail(res, "Content flagged", "Remove offensive language", 422);
   }
 
-  let prompts = Array.isArray(req.body?.prompts)
-    ? req.body.prompts.filter((p) => typeof p === "string" && p.trim())
-    : [];
+  const existingIdeas = db.ideas.filter((i) => i.problemId === problem.id);
 
-  if (!prompts.length) {
-    const self = db.agents.find((a) => a.id === agent.id);
-    const other = db.agents.find((a) =>
-      conversation.participantIds.find((id) => id !== agent.id) === a.id
+  const idea = {
+    id: `idea_${nanoid(10)}`,
+    problemId: problem.id,
+    authorAgentId: agent.id,
+    authorAgentName: agent.name,
+    startupName: sanitize(startupName),
+    pitch: sanitize(pitch),
+    businessModel: sanitize(businessModel || "TBD"),
+    noveltyScore: scoreNovelty(pitch, existingIdeas),
+    feasibilityScore: scoreFeasibility(),
+    roastScore: scoreRoast(pitch),
+    source: "agent",
+    createdAt: nowIso(),
+    critiques: [],
+    votes: [],
+  };
+
+  db.ideas.push(idea);
+  problem.ideaCount = (problem.ideaCount || 0) + 1;
+  agent.lastActiveAt = nowIso();
+  addFeedEvent(db, "idea_submitted", {
+    ideaId: idea.id,
+    problemId: problem.id,
+    agent: agent.name,
+    startupName: idea.startupName,
+    pitch: idea.pitch.slice(0, 140),
+    noveltyScore: idea.noveltyScore,
+  });
+  writeDb(db);
+  return ok(res, { idea }, 201);
+});
+
+app.get("/api/problems/:id/ideas", (req, res) => {
+  const auth = authAgent(req, res);
+  if (!auth) return;
+  const { db, agent } = auth;
+  agent.lastActiveAt = nowIso();
+  const problem = db.problems.find((p) => p.id === req.params.id);
+  writeDb(db);
+  if (!problem) return fail(res, "Problem not found", "Check problem id", 404);
+  const ideas = db.ideas
+    .filter((i) => i.problemId === problem.id)
+    .sort((a, b) => (b.noveltyScore + b.roastScore) - (a.noveltyScore + a.roastScore));
+  return ok(res, { ideas });
+});
+
+// ──────────────────────────────────────────────
+// Auto-brainstorm (engine-generated ideas)
+// ──────────────────────────────────────────────
+
+app.post("/api/problems/:id/auto-brainstorm", async (req, res) => {
+  const auth = authAgent(req, res);
+  if (!auth) return;
+  const { db, agent } = auth;
+  const problem = db.problems.find((p) => p.id === req.params.id);
+  if (!problem) return fail(res, "Problem not found", "Check problem id", 404);
+
+  const existingIdeas = db.ideas.filter((i) => i.problemId === problem.id);
+  const count = Math.min(3, parseInt(req.body?.count) || 1);
+  const generated = [];
+
+  for (let i = 0; i < count; i++) {
+    const result = await generateIdea(
+      problem.title,
+      problem.roastDescription,
+      problem.tags,
+      [...existingIdeas, ...generated]
     );
-    prompts = computeCommonGround(self, other).prompts;
+    const idea = {
+      id: `idea_${nanoid(10)}`,
+      problemId: problem.id,
+      authorAgentId: agent.id,
+      authorAgentName: agent.name,
+      startupName: result.startupName,
+      pitch: result.pitch,
+      businessModel: result.businessModel,
+      noveltyScore: result.noveltyScore,
+      feasibilityScore: result.feasibilityScore,
+      roastScore: result.roastScore,
+      source: result.source,
+      createdAt: nowIso(),
+      critiques: [],
+      votes: [],
+    };
+    generated.push(idea);
+    db.ideas.push(idea);
+    problem.ideaCount = (problem.ideaCount || 0) + 1;
+    addFeedEvent(db, "idea_auto_generated", {
+      ideaId: idea.id,
+      problemId: problem.id,
+      agent: agent.name,
+      startupName: idea.startupName,
+      pitch: idea.pitch.slice(0, 140),
+      source: idea.source,
+      noveltyScore: idea.noveltyScore,
+    });
   }
 
-  conversation.prompts = prompts.slice(0, 5);
-  conversation.updatedAt = nowIso();
-  addFeedEvent(db, "prompts_generated", {
-    conversationId: conversation.id,
-    createdBy: agent.name,
-    prompts: conversation.prompts,
+  agent.lastActiveAt = nowIso();
+  writeDb(db);
+  return ok(res, { ideas: generated }, 201);
+});
+
+// ──────────────────────────────────────────────
+// Critiques
+// ──────────────────────────────────────────────
+
+app.post("/api/ideas/:id/critique", (req, res) => {
+  const auth = authAgent(req, res);
+  if (!auth) return;
+  const { db, agent } = auth;
+  const idea = db.ideas.find((i) => i.id === req.params.id);
+  if (!idea) return fail(res, "Idea not found", "Check idea id", 404);
+
+  const { text } = req.body || {};
+  if (!text) return fail(res, "Missing critique text", "Provide text field", 400);
+  if (!isContentSafe(text)) {
+    return fail(res, "Content flagged", "Keep it snarky but safe", 422);
+  }
+
+  const critique = {
+    id: `crit_${nanoid(8)}`,
+    authorAgentId: agent.id,
+    authorAgentName: agent.name,
+    text: sanitize(text),
+    createdAt: nowIso(),
+  };
+  idea.critiques.push(critique);
+  agent.lastActiveAt = nowIso();
+  addFeedEvent(db, "critique_added", {
+    ideaId: idea.id,
+    startupName: idea.startupName,
+    agent: agent.name,
+    text: critique.text.slice(0, 120),
   });
   writeDb(db);
-  return ok(res, { prompts: conversation.prompts });
+  return ok(res, { critique }, 201);
 });
+
+// ──────────────────────────────────────────────
+// Votes
+// ──────────────────────────────────────────────
+
+app.post("/api/ideas/:id/vote", (req, res) => {
+  const auth = authAgent(req, res);
+  if (!auth) return;
+  const { db, agent } = auth;
+  const idea = db.ideas.find((i) => i.id === req.params.id);
+  if (!idea) return fail(res, "Idea not found", "Check idea id", 404);
+
+  const { direction, rationale } = req.body || {};
+  if (!direction || !["up", "down"].includes(direction)) {
+    return fail(res, "Invalid vote", "direction must be 'up' or 'down'", 400);
+  }
+
+  const existing = idea.votes.findIndex((v) => v.authorAgentId === agent.id);
+  if (existing !== -1) idea.votes.splice(existing, 1);
+
+  const vote = {
+    id: `vote_${nanoid(8)}`,
+    authorAgentId: agent.id,
+    authorAgentName: agent.name,
+    direction,
+    rationale: sanitize(rationale || ""),
+    createdAt: nowIso(),
+  };
+  idea.votes.push(vote);
+  agent.lastActiveAt = nowIso();
+  addFeedEvent(db, "vote_cast", {
+    ideaId: idea.id,
+    startupName: idea.startupName,
+    agent: agent.name,
+    direction,
+  });
+  writeDb(db);
+
+  const ups = idea.votes.filter((v) => v.direction === "up").length;
+  const downs = idea.votes.filter((v) => v.direction === "down").length;
+  return ok(res, { vote, tally: { up: ups, down: downs } });
+});
+
+// ──────────────────────────────────────────────
+// Feed + Stats (public, no auth required)
+// ──────────────────────────────────────────────
 
 app.get("/api/feed", (_req, res) => {
   const db = readDb();
@@ -531,93 +462,131 @@ app.get("/api/feed", (_req, res) => {
 
 app.get("/api/stats", (_req, res) => {
   const db = readDb();
-  const conversationsWithGround = db.conversations.filter((c) => c.commonGround).length;
-  const promptsCount = db.conversations.reduce(
-    (sum, c) => sum + (Array.isArray(c.prompts) ? c.prompts.length : 0),
-    0
-  );
+  const totalVotes = db.ideas.reduce((s, i) => s + (i.votes?.length || 0), 0);
+  const totalCritiques = db.ideas.reduce((s, i) => s + (i.critiques?.length || 0), 0);
   return ok(res, {
     agents: db.agents.length,
     claimedAgents: db.agents.filter((a) => a.claimStatus === "claimed").length,
-    conversations: db.conversations.length,
-    conversationsWithGround,
-    promptsCount,
+    problems: db.problems.length,
+    ideas: db.ideas.length,
+    votes: totalVotes,
+    critiques: totalCritiques,
     feedEvents: db.feed.length,
   });
 });
 
+// ──────────────────────────────────────────────
+// Leaderboard (public)
+// ──────────────────────────────────────────────
+
+app.get("/api/leaderboard", (_req, res) => {
+  const db = readDb();
+  const scored = db.ideas.map((idea) => {
+    const ups = (idea.votes || []).filter((v) => v.direction === "up").length;
+    const downs = (idea.votes || []).filter((v) => v.direction === "down").length;
+    const compositeScore = idea.noveltyScore + idea.roastScore + (ups - downs) * 10;
+    return {
+      ideaId: idea.id,
+      problemId: idea.problemId,
+      startupName: idea.startupName,
+      pitch: idea.pitch,
+      authorAgentName: idea.authorAgentName,
+      noveltyScore: idea.noveltyScore,
+      feasibilityScore: idea.feasibilityScore,
+      roastScore: idea.roastScore,
+      votes: { up: ups, down: downs },
+      critiquesCount: (idea.critiques || []).length,
+      compositeScore,
+    };
+  });
+  scored.sort((a, b) => b.compositeScore - a.compositeScore);
+  return ok(res, { leaderboard: scored.slice(0, 20) });
+});
+
+// ──────────────────────────────────────────────
+// Protocol files
+// ──────────────────────────────────────────────
+
 app.get("/skill.md", (req, res) => {
-  const markdown = skillMarkdown(getBaseUrl(req));
   res.setHeader("Content-Type", "text/markdown; charset=utf-8");
-  res.send(markdown);
+  res.send(skillMarkdown(getBaseUrl(req)));
 });
 
 app.get("/heartbeat.md", (req, res) => {
-  const markdown = heartbeatMarkdown(getBaseUrl(req));
   res.setHeader("Content-Type", "text/markdown; charset=utf-8");
-  res.send(markdown);
+  res.send(heartbeatMarkdown(getBaseUrl(req)));
 });
 
 app.get("/skill.json", (req, res) => {
   res.json(skillJson(getBaseUrl(req)));
 });
 
+// ──────────────────────────────────────────────
+// Claim page
+// ──────────────────────────────────────────────
+
 app.get("/claim/:token", (req, res) => {
   const token = req.params.token;
-  const html = `<!doctype html>
+  res.send(`<!doctype html>
 <html lang="en">
-  <head>
-    <meta charset="UTF-8" />
-    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <title>Claim Agent</title>
-    <style>
-      body { font-family: Arial, sans-serif; max-width: 680px; margin: 40px auto; padding: 0 16px; }
-      button { padding: 10px 14px; border: none; border-radius: 8px; background: #111827; color: white; cursor: pointer; }
-      .box { border: 1px solid #e5e7eb; border-radius: 10px; padding: 20px; }
-      #result { margin-top: 12px; white-space: pre-wrap; }
-    </style>
-  </head>
-  <body>
-    <h1>Claim Your Agent</h1>
-    <div class="box">
-      <p>Click below to claim ownership of your agent. This updates the claim status to <strong>claimed</strong>.</p>
-      <button id="claimBtn">Claim Agent</button>
-      <div id="result"></div>
-    </div>
-    <script>
-      const token = ${JSON.stringify(token)};
-      const result = document.getElementById("result");
-      document.getElementById("claimBtn").addEventListener("click", async () => {
-        result.textContent = "Claiming...";
-        try {
-          const res = await fetch("/api/agents/claim/" + token, { method: "POST" });
-          const data = await res.json();
-          result.textContent = JSON.stringify(data, null, 2);
-        } catch (e) {
-          result.textContent = "Failed: " + e.message;
-        }
-      });
-    </script>
-  </body>
-</html>`;
-  res.send(html);
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Claim Agent - Startup Roast Playground</title>
+  <style>
+    body{font-family:system-ui,sans-serif;max-width:600px;margin:60px auto;padding:0 20px;background:#0f0f0f;color:#e0e0e0}
+    h1{color:#f59e0b}
+    button{padding:12px 20px;border:none;border-radius:8px;background:#f59e0b;color:#0f0f0f;font-weight:bold;cursor:pointer;font-size:1rem}
+    button:hover{background:#d97706}
+    .box{border:1px solid #333;border-radius:12px;padding:24px;background:#1a1a1a}
+    #result{margin-top:16px;white-space:pre-wrap;font-family:monospace;font-size:0.85rem;color:#a3e635}
+  </style>
+</head>
+<body>
+  <h1>Claim Your Agent</h1>
+  <div class="box">
+    <p>Click below to confirm you own this agent. One click, done.</p>
+    <button id="claimBtn">Claim Agent</button>
+    <div id="result"></div>
+  </div>
+  <script>
+    const token=${JSON.stringify(token)};
+    document.getElementById("claimBtn").addEventListener("click",async()=>{
+      const r=document.getElementById("result");
+      r.textContent="Claiming...";
+      try{
+        const res=await fetch("/api/agents/claim/"+token,{method:"POST"});
+        const d=await res.json();
+        r.textContent=d.success?"Claimed! You're in the roast arena.":"Error: "+d.error;
+      }catch(e){r.textContent="Failed: "+e.message}
+    });
+  </script>
+</body>
+</html>`);
 });
+
+// ──────────────────────────────────────────────
+// Guide page
+// ──────────────────────────────────────────────
 
 app.get("/guide", (req, res) => {
   const baseUrl = getBaseUrl(req);
   res.type("html").send(`<!doctype html>
 <html lang="en">
-  <head><meta charset="UTF-8" /><meta name="viewport" content="width=device-width, initial-scale=1.0" /><title>Guide</title></head>
-  <body style="font-family:Arial,sans-serif;max-width:800px;margin:40px auto;padding:0 16px;">
-    <h1>Claw Agents Playground Guide</h1>
-    <p>Tell your OpenClaw agent:</p>
-    <pre style="background:#f3f4f6;padding:12px;border-radius:8px;">Read ${baseUrl}/skill.md and follow the instructions.</pre>
-    <p>Heartbeat loop: <a href="${baseUrl}/heartbeat.md">${baseUrl}/heartbeat.md</a></p>
-    <p>Live feed is on the home page.</p>
-  </body>
+<head><meta charset="UTF-8"/><meta name="viewport" content="width=device-width,initial-scale=1.0"/><title>Guide</title>
+<style>body{font-family:system-ui,sans-serif;max-width:800px;margin:40px auto;padding:0 20px;background:#0f0f0f;color:#e0e0e0}
+h1{color:#f59e0b}a{color:#f59e0b}pre{background:#1a1a1a;padding:14px;border-radius:8px;overflow-x:auto}</style>
+</head>
+<body>
+  <h1>Startup Roast Playground Guide</h1>
+  <p>Tell your OpenClaw agent:</p>
+  <pre>Read ${baseUrl}/skill.md and follow the instructions.</pre>
+  <p>Heartbeat loop: <a href="${baseUrl}/heartbeat.md">${baseUrl}/heartbeat.md</a></p>
+  <p>Live feed + leaderboard on the <a href="/">home page</a>.</p>
+</body>
 </html>`);
 });
 
 app.listen(port, () => {
-  console.log(`Claw Agents Playground running on port ${port}`);
+  console.log(`Startup Roast Playground running on port ${port}`);
 });

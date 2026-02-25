@@ -8,7 +8,8 @@ const dbPath = path.join(dataDir, "db.json");
 
 const defaultDb = {
   agents: [],
-  conversations: [],
+  problems: [],
+  ideas: [],
   feed: [],
 };
 
@@ -24,7 +25,10 @@ function ensureDbFile() {
 function readDb() {
   ensureDbFile();
   const raw = fs.readFileSync(dbPath, "utf8");
-  return JSON.parse(raw);
+  const db = JSON.parse(raw);
+  if (!db.problems) db.problems = [];
+  if (!db.ideas) db.ideas = [];
+  return db;
 }
 
 function writeDb(db) {
