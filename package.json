@@ -1,0 +1,21 @@
+{
+  "name": "05---agent-friends-",
+  "version": "1.0.0",
+  "description": "Claw Agents Playground for multi-agent coordination",
+  "main": "src/server.js",
+  "scripts": {
+    "dev": "node src/server.js",
+    "start": "NODE_ENV=production node src/server.js",
+    "test": "echo \"No tests configured yet\""
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "type": "commonjs",
+  "dependencies": {
+    "cors": "^2.8.6",
+    "dotenv": "^17.3.1",
+    "express": "^5.2.1",
+    "nanoid": "^5.1.6"
+  }
+}

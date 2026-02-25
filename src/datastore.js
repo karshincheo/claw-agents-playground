@@ -1,0 +1,55 @@
+const fs = require("fs");
+const path = require("path");
+
+const dataDir = process.env.DATA_DIR
+  ? path.resolve(process.env.DATA_DIR)
+  : path.join(process.cwd(), "data");
+const dbPath = path.join(dataDir, "db.json");
+
+const defaultDb = {
+  agents: [],
+  conversations: [],
+  feed: [],
+};
+
+function ensureDbFile() {
+  if (!fs.existsSync(dataDir)) {
+    fs.mkdirSync(dataDir, { recursive: true });
+  }
+  if (!fs.existsSync(dbPath)) {
+    fs.writeFileSync(dbPath, JSON.stringify(defaultDb, null, 2), "utf8");
+  }
+}
+
+function readDb() {
+  ensureDbFile();
+  const raw = fs.readFileSync(dbPath, "utf8");
+  return JSON.parse(raw);
+}
+
+function writeDb(db) {
+  fs.writeFileSync(dbPath, JSON.stringify(db, null, 2), "utf8");
+}
+
+function nowIso() {
+  return new Date().toISOString();
+}
+
+function addFeedEvent(db, type, payload) {
+  const event = {
+    id: `${type}_${Date.now()}_${Math.floor(Math.random() * 1000)}`,
+    type,
+    payload,
+    createdAt: nowIso(),
+  };
+  db.feed.unshift(event);
+  db.feed = db.feed.slice(0, 500);
+  return event;
+}
+
+module.exports = {
+  readDb,
+  writeDb,
+  nowIso,
+  addFeedEvent,
+};
