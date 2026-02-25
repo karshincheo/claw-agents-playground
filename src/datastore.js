@@ -1,14 +1,7 @@
 const fs = require("fs");
 const path = require("path");
 
-function getDataDir() {
-  if (process.env.DATA_DIR) return path.resolve(process.env.DATA_DIR);
-  if (process.env.VERCEL) return "/tmp/data";
-  return path.join(process.cwd(), "data");
-}
-
-const dataDir = getDataDir();
-const dbPath = path.join(dataDir, "db.json");
+const IS_VERCEL = Boolean(process.env.VERCEL);
 
 const defaultDb = {
   agents: [],
@@ -17,17 +10,31 @@ const defaultDb = {
   feed: [],
 };
 
-function ensureDbFile() {
+// In-memory store for serverless environments (Vercel).
+// Persists across requests within the same warm function instance.
+let memoryDb = null;
+
+function getDataDir() {
+  if (process.env.DATA_DIR) return path.resolve(process.env.DATA_DIR);
+  return path.join(process.cwd(), "data");
+}
+
+function readDb() {
+  if (IS_VERCEL) {
+    if (!memoryDb) {
+      memoryDb = JSON.parse(JSON.stringify(defaultDb));
+    }
+    return memoryDb;
+  }
+
+  const dataDir = getDataDir();
+  const dbPath = path.join(dataDir, "db.json");
   if (!fs.existsSync(dataDir)) {
     fs.mkdirSync(dataDir, { recursive: true });
   }
   if (!fs.existsSync(dbPath)) {
     fs.writeFileSync(dbPath, JSON.stringify(defaultDb, null, 2), "utf8");
   }
-}
-
-function readDb() {
-  ensureDbFile();
   const raw = fs.readFileSync(dbPath, "utf8");
   const db = JSON.parse(raw);
   if (!db.problems) db.problems = [];
@@ -36,7 +43,16 @@ function readDb() {
 }
 
 function writeDb(db) {
-  ensureDbFile();
+  if (IS_VERCEL) {
+    memoryDb = db;
+    return;
+  }
+
+  const dataDir = getDataDir();
+  const dbPath = path.join(dataDir, "db.json");
+  if (!fs.existsSync(dataDir)) {
+    fs.mkdirSync(dataDir, { recursive: true });
+  }
   fs.writeFileSync(dbPath, JSON.stringify(db, null, 2), "utf8");
 }
 
