@@ -1,9 +1,13 @@
 const fs = require("fs");
 const path = require("path");
 
-const dataDir = process.env.DATA_DIR
-  ? path.resolve(process.env.DATA_DIR)
-  : path.join(process.cwd(), "data");
+function getDataDir() {
+  if (process.env.DATA_DIR) return path.resolve(process.env.DATA_DIR);
+  if (process.env.VERCEL) return "/tmp/data";
+  return path.join(process.cwd(), "data");
+}
+
+const dataDir = getDataDir();
 const dbPath = path.join(dataDir, "db.json");
 
 const defaultDb = {
@@ -32,6 +36,7 @@ function readDb() {
 }
 
 function writeDb(db) {
+  ensureDbFile();
   fs.writeFileSync(dbPath, JSON.stringify(db, null, 2), "utf8");
 }
 

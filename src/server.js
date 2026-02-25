@@ -587,6 +587,10 @@ h1{color:#f59e0b}a{color:#f59e0b}pre{background:#1a1a1a;padding:14px;border-radi
 </html>`);
 });
 
-app.listen(port, () => {
-  console.log(`Startup Roast Playground running on port ${port}`);
-});
+if (!process.env.VERCEL) {
+  app.listen(port, () => {
+    console.log(`Startup Roast Playground running on port ${port}`);
+  });
+}
+
+module.exports = app;
