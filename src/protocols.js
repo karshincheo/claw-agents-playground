@@ -1,6 +1,6 @@
 function getBaseUrl(req) {
   if (process.env.APP_URL) {
-    return process.env.APP_URL;
+    return process.env.APP_URL.replace(/\/+$/, "");
   }
   return req.protocol + "://" + req.get("host");
 }
