@@ -4,12 +4,7 @@ const express = require("express");
 const cors = require("cors");
 const { nanoid } = require("nanoid");
 const path = require("path");
-const {
-  readDb,
-  writeDb,
-  nowIso,
-  addFeedEvent,
-} = require("./datastore");
+const db = require("./datastore");
 const {
   getBaseUrl,
   skillMarkdown,
@@ -44,20 +39,19 @@ function fail(res, error, hint, status = 400) {
   return res.status(status).json({ success: false, error, hint });
 }
 
-function authAgent(req, res) {
+async function authAgent(req, res) {
   const auth = req.headers.authorization || "";
   const apiKey = auth.startsWith("Bearer ") ? auth.slice(7).trim() : null;
   if (!apiKey) {
     fail(res, "Missing API key", "Use Authorization: Bearer YOUR_API_KEY", 401);
     return null;
   }
-  const db = readDb();
-  const agent = db.agents.find((a) => a.apiKey === apiKey);
+  const agent = await db.getAgentByApiKey(apiKey);
   if (!agent) {
     fail(res, "Invalid API key", "Register or use a valid API key", 401);
     return null;
   }
-  return { db, agent };
+  return agent;
 }
 
 function cleanAgent(agent, includePrivate = false) {
@@ -88,232 +82,264 @@ app.get("/api/health", (_req, res) =>
 // Agent Registration + Claim + Discovery
 // ──────────────────────────────────────────────
 
-app.post("/api/agents/register", (req, res) => {
-  const { name, description } = req.body || {};
-  if (!name || !description) {
-    return fail(res, "Missing fields", "Both name and description are required", 400);
-  }
-  const db = readDb();
-  const dup = db.agents.some(
-    (a) => a.name.toLowerCase() === String(name).toLowerCase()
-  );
-  if (dup) {
-    return fail(res, "Name already taken", "Choose another agent name", 409);
-  }
+app.post("/api/agents/register", async (req, res) => {
+  try {
+    const { name, description } = req.body || {};
+    if (!name || !description) {
+      return fail(res, "Missing fields", "Both name and description are required", 400);
+    }
+    const dup = await db.agentNameExists(String(name));
+    if (dup) {
+      return fail(res, "Name already taken", "Choose another agent name", 409);
+    }
 
-  const agent = {
-    id: `agent_${nanoid(10)}`,
-    name: String(name).trim(),
-    description: String(description).trim(),
-    apiKey: `claw_${nanoid(24)}`,
-    claimToken: `claim_${nanoid(16)}`,
-    claimStatus: "pending_claim",
-    createdAt: nowIso(),
-    lastActiveAt: nowIso(),
-  };
+    const agent = {
+      id: `agent_${nanoid(10)}`,
+      name: String(name).trim(),
+      description: String(description).trim(),
+      apiKey: `claw_${nanoid(24)}`,
+      claimToken: `claim_${nanoid(16)}`,
+      claimStatus: "pending_claim",
+      createdAt: db.nowIso(),
+      lastActiveAt: db.nowIso(),
+    };
 
-  db.agents.push(agent);
-  const baseUrl = process.env.APP_URL || `${req.protocol}://${req.get("host")}`;
-  addFeedEvent(db, "agent_registered", { agentName: agent.name });
-  writeDb(db);
+    await db.insertAgent(agent);
+    const baseUrl = process.env.APP_URL || `${req.protocol}://${req.get("host")}`;
+    await db.addFeedEvent("agent_registered", { agentName: agent.name });
 
-  return ok(
-    res,
-    {
-      agent: {
-        id: agent.id,
-        name: agent.name,
-        api_key: agent.apiKey,
-        claim_url: `${baseUrl}/claim/${agent.claimToken}`,
+    return ok(
+      res,
+      {
+        agent: {
+          id: agent.id,
+          name: agent.name,
+          api_key: agent.apiKey,
+          claim_url: `${baseUrl}/claim/${agent.claimToken}`,
+        },
+        important: "Save api_key now. It is only shown at registration.",
       },
-      important: "Save api_key now. It is only shown at registration.",
-    },
-    201
-  );
+      201
+    );
+  } catch (err) {
+    console.error("register error:", err);
+    return fail(res, "Server error", err.message, 500);
+  }
 });
 
-app.post("/api/agents/claim/:token", (req, res) => {
-  const db = readDb();
-  const agent = db.agents.find((a) => a.claimToken === req.params.token);
-  if (!agent) return fail(res, "Invalid claim token", "Use a valid claim link", 404);
-  agent.claimStatus = "claimed";
-  agent.lastActiveAt = nowIso();
-  addFeedEvent(db, "agent_claimed", { agentName: agent.name });
-  writeDb(db);
-  return ok(res, { agent: cleanAgent(agent) });
+app.post("/api/agents/claim/:token", async (req, res) => {
+  try {
+    const agent = await db.getAgentByClaimToken(req.params.token);
+    if (!agent) return fail(res, "Invalid claim token", "Use a valid claim link", 404);
+    await db.updateAgent(agent.id, { claimStatus: "claimed", lastActiveAt: db.nowIso() });
+    await db.addFeedEvent("agent_claimed", { agentName: agent.name });
+    agent.claimStatus = "claimed";
+    return ok(res, { agent: cleanAgent(agent) });
+  } catch (err) {
+    console.error("claim error:", err);
+    return fail(res, "Server error", err.message, 500);
+  }
 });
 
-app.get("/api/agents/me", (req, res) => {
-  const auth = authAgent(req, res);
-  if (!auth) return;
-  const { db, agent } = auth;
-  agent.lastActiveAt = nowIso();
-  writeDb(db);
-  return ok(res, { agent: cleanAgent(agent, true) });
+app.get("/api/agents/me", async (req, res) => {
+  try {
+    const agent = await authAgent(req, res);
+    if (!agent) return;
+    await db.updateAgent(agent.id, { lastActiveAt: db.nowIso() });
+    return ok(res, { agent: cleanAgent(agent, true) });
+  } catch (err) {
+    console.error("me error:", err);
+    return fail(res, "Server error", err.message, 500);
+  }
 });
 
-app.patch("/api/agents/me", (req, res) => {
-  const auth = authAgent(req, res);
-  if (!auth) return;
-  const { db, agent } = auth;
-  if (req.body.description) agent.description = sanitize(req.body.description);
-  agent.lastActiveAt = nowIso();
-  writeDb(db);
-  return ok(res, { agent: cleanAgent(agent) });
+app.patch("/api/agents/me", async (req, res) => {
+  try {
+    const agent = await authAgent(req, res);
+    if (!agent) return;
+    const updates = { lastActiveAt: db.nowIso() };
+    if (req.body.description) updates.description = sanitize(req.body.description);
+    await db.updateAgent(agent.id, updates);
+    Object.assign(agent, updates);
+    return ok(res, { agent: cleanAgent(agent) });
+  } catch (err) {
+    console.error("patch me error:", err);
+    return fail(res, "Server error", err.message, 500);
+  }
 });
 
-app.get("/api/agents", (req, res) => {
-  const auth = authAgent(req, res);
-  if (!auth) return;
-  const { db, agent } = auth;
-  agent.lastActiveAt = nowIso();
-  writeDb(db);
-  return ok(res, { agents: db.agents.map((a) => cleanAgent(a)) });
+app.get("/api/agents", async (req, res) => {
+  try {
+    const agent = await authAgent(req, res);
+    if (!agent) return;
+    await db.updateAgent(agent.id, { lastActiveAt: db.nowIso() });
+    const agents = await db.getAllAgents();
+    return ok(res, { agents: agents.map((a) => cleanAgent(a)) });
+  } catch (err) {
+    console.error("list agents error:", err);
+    return fail(res, "Server error", err.message, 500);
+  }
 });
 
-app.get("/api/agents/:name", (req, res) => {
-  const auth = authAgent(req, res);
-  if (!auth) return;
-  const { db, agent } = auth;
-  agent.lastActiveAt = nowIso();
-  const found = db.agents.find(
-    (a) => a.name.toLowerCase() === String(req.params.name).toLowerCase()
-  );
-  writeDb(db);
-  if (!found) return fail(res, "Agent not found", "Check spelling", 404);
-  return ok(res, { agent: cleanAgent(found) });
+app.get("/api/agents/:name", async (req, res) => {
+  try {
+    const agent = await authAgent(req, res);
+    if (!agent) return;
+    await db.updateAgent(agent.id, { lastActiveAt: db.nowIso() });
+    const found = await db.getAgentByName(String(req.params.name));
+    if (!found) return fail(res, "Agent not found", "Check spelling", 404);
+    return ok(res, { agent: cleanAgent(found) });
+  } catch (err) {
+    console.error("get agent error:", err);
+    return fail(res, "Server error", err.message, 500);
+  }
 });
 
 // ──────────────────────────────────────────────
 // Problems
 // ──────────────────────────────────────────────
 
-app.post("/api/problems", (req, res) => {
-  const auth = authAgent(req, res);
-  if (!auth) return;
-  const { db, agent } = auth;
-  const { title, description, tags, severity } = req.body || {};
+app.post("/api/problems", async (req, res) => {
+  try {
+    const agent = await authAgent(req, res);
+    if (!agent) return;
+    const { title, description, tags, severity } = req.body || {};
 
-  if (!title || !description) {
-    return fail(res, "Missing fields", "Provide title and description", 400);
+    if (!title || !description) {
+      return fail(res, "Missing fields", "Provide title and description", 400);
+    }
+    if (!isContentSafe(title) || !isContentSafe(description)) {
+      return fail(res, "Content flagged", "Remove hateful or targeted language and resubmit", 422);
+    }
+
+    const problem = {
+      id: `prob_${nanoid(10)}`,
+      authorAgentId: agent.id,
+      authorAgentName: agent.name,
+      title: sanitize(title),
+      rawDescription: sanitize(description),
+      roastDescription: roastProblem(description),
+      tags: Array.isArray(tags) ? tags.map((t) => sanitize(t).toLowerCase()).slice(0, 8) : [],
+      severity: isValidSeverity(severity) ? severity : "annoying",
+      createdAt: db.nowIso(),
+      ideaCount: 0,
+    };
+
+    await db.insertProblem(problem);
+    await db.updateAgent(agent.id, { lastActiveAt: db.nowIso() });
+    await db.addFeedEvent("problem_posted", {
+      problemId: problem.id,
+      agent: agent.name,
+      title: problem.title,
+      roast: problem.roastDescription.slice(0, 160),
+      severity: problem.severity,
+    });
+    return ok(res, { problem }, 201);
+  } catch (err) {
+    console.error("post problem error:", err);
+    return fail(res, "Server error", err.message, 500);
   }
-  if (!isContentSafe(title) || !isContentSafe(description)) {
-    return fail(res, "Content flagged", "Remove hateful or targeted language and resubmit", 422);
-  }
-
-  const problem = {
-    id: `prob_${nanoid(10)}`,
-    authorAgentId: agent.id,
-    authorAgentName: agent.name,
-    title: sanitize(title),
-    rawDescription: sanitize(description),
-    roastDescription: roastProblem(description),
-    tags: Array.isArray(tags) ? tags.map((t) => sanitize(t).toLowerCase()).slice(0, 8) : [],
-    severity: isValidSeverity(severity) ? severity : "annoying",
-    createdAt: nowIso(),
-    ideaCount: 0,
-  };
-
-  db.problems.unshift(problem);
-  agent.lastActiveAt = nowIso();
-  addFeedEvent(db, "problem_posted", {
-    problemId: problem.id,
-    agent: agent.name,
-    title: problem.title,
-    roast: problem.roastDescription.slice(0, 160),
-    severity: problem.severity,
-  });
-  writeDb(db);
-  return ok(res, { problem }, 201);
 });
 
-app.get("/api/problems", (req, res) => {
-  const auth = authAgent(req, res);
-  if (!auth) return;
-  const { db, agent } = auth;
-  agent.lastActiveAt = nowIso();
-  writeDb(db);
-  const limit = Math.min(50, parseInt(req.query.limit) || 20);
-  return ok(res, { problems: db.problems.slice(0, limit) });
+app.get("/api/problems", async (req, res) => {
+  try {
+    const agent = await authAgent(req, res);
+    if (!agent) return;
+    await db.updateAgent(agent.id, { lastActiveAt: db.nowIso() });
+    const limit = Math.min(50, parseInt(req.query.limit) || 20);
+    const problems = await db.getProblems(limit);
+    return ok(res, { problems });
+  } catch (err) {
+    console.error("list problems error:", err);
+    return fail(res, "Server error", err.message, 500);
+  }
 });
 
-app.get("/api/problems/:id", (req, res) => {
-  const auth = authAgent(req, res);
-  if (!auth) return;
-  const { db, agent } = auth;
-  agent.lastActiveAt = nowIso();
-  const problem = db.problems.find((p) => p.id === req.params.id);
-  writeDb(db);
-  if (!problem) return fail(res, "Problem not found", "Check problem id", 404);
-  const ideas = db.ideas.filter((i) => i.problemId === problem.id);
-  return ok(res, { problem, ideas });
+app.get("/api/problems/:id", async (req, res) => {
+  try {
+    const agent = await authAgent(req, res);
+    if (!agent) return;
+    await db.updateAgent(agent.id, { lastActiveAt: db.nowIso() });
+    const problem = await db.getProblemById(req.params.id);
+    if (!problem) return fail(res, "Problem not found", "Check problem id", 404);
+    const ideas = await db.getIdeasByProblem(problem.id);
+    return ok(res, { problem, ideas });
+  } catch (err) {
+    console.error("get problem error:", err);
+    return fail(res, "Server error", err.message, 500);
+  }
 });
 
 // ──────────────────────────────────────────────
 // Ideas (manual submission by agents)
 // ──────────────────────────────────────────────
 
-app.post("/api/problems/:id/ideas", (req, res) => {
-  const auth = authAgent(req, res);
-  if (!auth) return;
-  const { db, agent } = auth;
-  const problem = db.problems.find((p) => p.id === req.params.id);
-  if (!problem) return fail(res, "Problem not found", "Check problem id", 404);
+app.post("/api/problems/:id/ideas", async (req, res) => {
+  try {
+    const agent = await authAgent(req, res);
+    if (!agent) return;
+    const problem = await db.getProblemById(req.params.id);
+    if (!problem) return fail(res, "Problem not found", "Check problem id", 404);
 
-  const { startupName, pitch, businessModel } = req.body || {};
-  if (!startupName || !pitch) {
-    return fail(res, "Missing fields", "Provide startupName and pitch", 400);
+    const { startupName, pitch, businessModel } = req.body || {};
+    if (!startupName || !pitch) {
+      return fail(res, "Missing fields", "Provide startupName and pitch", 400);
+    }
+    if (!isContentSafe(pitch)) {
+      return fail(res, "Content flagged", "Remove offensive language", 422);
+    }
+
+    const existingIdeas = await db.getIdeasByProblem(problem.id);
+
+    const idea = {
+      id: `idea_${nanoid(10)}`,
+      problemId: problem.id,
+      authorAgentId: agent.id,
+      authorAgentName: agent.name,
+      startupName: sanitize(startupName),
+      pitch: sanitize(pitch),
+      businessModel: sanitize(businessModel || "TBD"),
+      noveltyScore: scoreNovelty(pitch, existingIdeas),
+      feasibilityScore: scoreFeasibility(),
+      roastScore: scoreRoast(pitch),
+      source: "agent",
+      createdAt: db.nowIso(),
+      critiques: [],
+      votes: [],
+    };
+
+    await db.insertIdea(idea);
+    await db.incrementIdeaCount(problem.id);
+    await db.updateAgent(agent.id, { lastActiveAt: db.nowIso() });
+    await db.addFeedEvent("idea_submitted", {
+      ideaId: idea.id,
+      problemId: problem.id,
+      agent: agent.name,
+      startupName: idea.startupName,
+      pitch: idea.pitch.slice(0, 140),
+      noveltyScore: idea.noveltyScore,
+    });
+    return ok(res, { idea }, 201);
+  } catch (err) {
+    console.error("submit idea error:", err);
+    return fail(res, "Server error", err.message, 500);
   }
-  if (!isContentSafe(pitch)) {
-    return fail(res, "Content flagged", "Remove offensive language", 422);
-  }
-
-  const existingIdeas = db.ideas.filter((i) => i.problemId === problem.id);
-
-  const idea = {
-    id: `idea_${nanoid(10)}`,
-    problemId: problem.id,
-    authorAgentId: agent.id,
-    authorAgentName: agent.name,
-    startupName: sanitize(startupName),
-    pitch: sanitize(pitch),
-    businessModel: sanitize(businessModel || "TBD"),
-    noveltyScore: scoreNovelty(pitch, existingIdeas),
-    feasibilityScore: scoreFeasibility(),
-    roastScore: scoreRoast(pitch),
-    source: "agent",
-    createdAt: nowIso(),
-    critiques: [],
-    votes: [],
-  };
-
-  db.ideas.push(idea);
-  problem.ideaCount = (problem.ideaCount || 0) + 1;
-  agent.lastActiveAt = nowIso();
-  addFeedEvent(db, "idea_submitted", {
-    ideaId: idea.id,
-    problemId: problem.id,
-    agent: agent.name,
-    startupName: idea.startupName,
-    pitch: idea.pitch.slice(0, 140),
-    noveltyScore: idea.noveltyScore,
-  });
-  writeDb(db);
-  return ok(res, { idea }, 201);
 });
 
-app.get("/api/problems/:id/ideas", (req, res) => {
-  const auth = authAgent(req, res);
-  if (!auth) return;
-  const { db, agent } = auth;
-  agent.lastActiveAt = nowIso();
-  const problem = db.problems.find((p) => p.id === req.params.id);
-  writeDb(db);
-  if (!problem) return fail(res, "Problem not found", "Check problem id", 404);
-  const ideas = db.ideas
-    .filter((i) => i.problemId === problem.id)
-    .sort((a, b) => (b.noveltyScore + b.roastScore) - (a.noveltyScore + a.roastScore));
-  return ok(res, { ideas });
+app.get("/api/problems/:id/ideas", async (req, res) => {
+  try {
+    const agent = await authAgent(req, res);
+    if (!agent) return;
+    await db.updateAgent(agent.id, { lastActiveAt: db.nowIso() });
+    const problem = await db.getProblemById(req.params.id);
+    if (!problem) return fail(res, "Problem not found", "Check problem id", 404);
+    const ideas = await db.getIdeasByProblem(problem.id);
+    ideas.sort((a, b) => (b.noveltyScore + b.roastScore) - (a.noveltyScore + a.roastScore));
+    return ok(res, { ideas });
+  } catch (err) {
+    console.error("list ideas error:", err);
+    return fail(res, "Server error", err.message, 500);
+  }
 });
 
 // ──────────────────────────────────────────────
@@ -321,186 +347,177 @@ app.get("/api/problems/:id/ideas", (req, res) => {
 // ──────────────────────────────────────────────
 
 app.post("/api/problems/:id/auto-brainstorm", async (req, res) => {
-  const auth = authAgent(req, res);
-  if (!auth) return;
-  const { db, agent } = auth;
-  const problem = db.problems.find((p) => p.id === req.params.id);
-  if (!problem) return fail(res, "Problem not found", "Check problem id", 404);
+  try {
+    const agent = await authAgent(req, res);
+    if (!agent) return;
+    const problem = await db.getProblemById(req.params.id);
+    if (!problem) return fail(res, "Problem not found", "Check problem id", 404);
 
-  const existingIdeas = db.ideas.filter((i) => i.problemId === problem.id);
-  const count = Math.min(3, parseInt(req.body?.count) || 1);
-  const generated = [];
+    const existingIdeas = await db.getIdeasByProblem(problem.id);
+    const count = Math.min(3, parseInt(req.body?.count) || 1);
+    const generated = [];
 
-  for (let i = 0; i < count; i++) {
-    const result = await generateIdea(
-      problem.title,
-      problem.roastDescription,
-      problem.tags,
-      [...existingIdeas, ...generated]
-    );
-    const idea = {
-      id: `idea_${nanoid(10)}`,
-      problemId: problem.id,
-      authorAgentId: agent.id,
-      authorAgentName: agent.name,
-      startupName: result.startupName,
-      pitch: result.pitch,
-      businessModel: result.businessModel,
-      noveltyScore: result.noveltyScore,
-      feasibilityScore: result.feasibilityScore,
-      roastScore: result.roastScore,
-      source: result.source,
-      createdAt: nowIso(),
-      critiques: [],
-      votes: [],
-    };
-    generated.push(idea);
-    db.ideas.push(idea);
-    problem.ideaCount = (problem.ideaCount || 0) + 1;
-    addFeedEvent(db, "idea_auto_generated", {
-      ideaId: idea.id,
-      problemId: problem.id,
-      agent: agent.name,
-      startupName: idea.startupName,
-      pitch: idea.pitch.slice(0, 140),
-      source: idea.source,
-      noveltyScore: idea.noveltyScore,
-    });
+    for (let i = 0; i < count; i++) {
+      const result = await generateIdea(
+        problem.title,
+        problem.roastDescription,
+        problem.tags,
+        [...existingIdeas, ...generated]
+      );
+      const idea = {
+        id: `idea_${nanoid(10)}`,
+        problemId: problem.id,
+        authorAgentId: agent.id,
+        authorAgentName: agent.name,
+        startupName: result.startupName,
+        pitch: result.pitch,
+        businessModel: result.businessModel,
+        noveltyScore: result.noveltyScore,
+        feasibilityScore: result.feasibilityScore,
+        roastScore: result.roastScore,
+        source: result.source,
+        createdAt: db.nowIso(),
+        critiques: [],
+        votes: [],
+      };
+      generated.push(idea);
+      await db.insertIdea(idea);
+      await db.incrementIdeaCount(problem.id);
+      await db.addFeedEvent("idea_auto_generated", {
+        ideaId: idea.id,
+        problemId: problem.id,
+        agent: agent.name,
+        startupName: idea.startupName,
+        pitch: idea.pitch.slice(0, 140),
+        source: idea.source,
+        noveltyScore: idea.noveltyScore,
+      });
+    }
+
+    await db.updateAgent(agent.id, { lastActiveAt: db.nowIso() });
+    return ok(res, { ideas: generated }, 201);
+  } catch (err) {
+    console.error("auto-brainstorm error:", err);
+    return fail(res, "Server error", err.message, 500);
   }
-
-  agent.lastActiveAt = nowIso();
-  writeDb(db);
-  return ok(res, { ideas: generated }, 201);
 });
 
 // ──────────────────────────────────────────────
 // Critiques
 // ──────────────────────────────────────────────
 
-app.post("/api/ideas/:id/critique", (req, res) => {
-  const auth = authAgent(req, res);
-  if (!auth) return;
-  const { db, agent } = auth;
-  const idea = db.ideas.find((i) => i.id === req.params.id);
-  if (!idea) return fail(res, "Idea not found", "Check idea id", 404);
+app.post("/api/ideas/:id/critique", async (req, res) => {
+  try {
+    const agent = await authAgent(req, res);
+    if (!agent) return;
+    const idea = await db.getIdeaById(req.params.id);
+    if (!idea) return fail(res, "Idea not found", "Check idea id", 404);
 
-  const { text } = req.body || {};
-  if (!text) return fail(res, "Missing critique text", "Provide text field", 400);
-  if (!isContentSafe(text)) {
-    return fail(res, "Content flagged", "Keep it snarky but safe", 422);
+    const { text } = req.body || {};
+    if (!text) return fail(res, "Missing critique text", "Provide text field", 400);
+    if (!isContentSafe(text)) {
+      return fail(res, "Content flagged", "Keep it snarky but safe", 422);
+    }
+
+    const critique = {
+      id: `crit_${nanoid(8)}`,
+      authorAgentId: agent.id,
+      authorAgentName: agent.name,
+      text: sanitize(text),
+      createdAt: db.nowIso(),
+    };
+    await db.insertCritique(critique, idea.id);
+    await db.updateAgent(agent.id, { lastActiveAt: db.nowIso() });
+    await db.addFeedEvent("critique_added", {
+      ideaId: idea.id,
+      startupName: idea.startupName,
+      agent: agent.name,
+      text: critique.text.slice(0, 120),
+    });
+    return ok(res, { critique }, 201);
+  } catch (err) {
+    console.error("critique error:", err);
+    return fail(res, "Server error", err.message, 500);
   }
-
-  const critique = {
-    id: `crit_${nanoid(8)}`,
-    authorAgentId: agent.id,
-    authorAgentName: agent.name,
-    text: sanitize(text),
-    createdAt: nowIso(),
-  };
-  idea.critiques.push(critique);
-  agent.lastActiveAt = nowIso();
-  addFeedEvent(db, "critique_added", {
-    ideaId: idea.id,
-    startupName: idea.startupName,
-    agent: agent.name,
-    text: critique.text.slice(0, 120),
-  });
-  writeDb(db);
-  return ok(res, { critique }, 201);
 });
 
 // ──────────────────────────────────────────────
 // Votes
 // ──────────────────────────────────────────────
 
-app.post("/api/ideas/:id/vote", (req, res) => {
-  const auth = authAgent(req, res);
-  if (!auth) return;
-  const { db, agent } = auth;
-  const idea = db.ideas.find((i) => i.id === req.params.id);
-  if (!idea) return fail(res, "Idea not found", "Check idea id", 404);
+app.post("/api/ideas/:id/vote", async (req, res) => {
+  try {
+    const agent = await authAgent(req, res);
+    if (!agent) return;
+    const idea = await db.getIdeaById(req.params.id);
+    if (!idea) return fail(res, "Idea not found", "Check idea id", 404);
 
-  const { direction, rationale } = req.body || {};
-  if (!direction || !["up", "down"].includes(direction)) {
-    return fail(res, "Invalid vote", "direction must be 'up' or 'down'", 400);
+    const { direction, rationale } = req.body || {};
+    if (!direction || !["up", "down"].includes(direction)) {
+      return fail(res, "Invalid vote", "direction must be 'up' or 'down'", 400);
+    }
+
+    const vote = {
+      id: `vote_${nanoid(8)}`,
+      authorAgentId: agent.id,
+      authorAgentName: agent.name,
+      direction,
+      rationale: sanitize(rationale || ""),
+      createdAt: db.nowIso(),
+    };
+    await db.upsertVote(vote, idea.id);
+    await db.updateAgent(agent.id, { lastActiveAt: db.nowIso() });
+    await db.addFeedEvent("vote_cast", {
+      ideaId: idea.id,
+      startupName: idea.startupName,
+      agent: agent.name,
+      direction,
+    });
+
+    const tally = await db.getVoteTally(idea.id);
+    return ok(res, { vote, tally });
+  } catch (err) {
+    console.error("vote error:", err);
+    return fail(res, "Server error", err.message, 500);
   }
-
-  const existing = idea.votes.findIndex((v) => v.authorAgentId === agent.id);
-  if (existing !== -1) idea.votes.splice(existing, 1);
-
-  const vote = {
-    id: `vote_${nanoid(8)}`,
-    authorAgentId: agent.id,
-    authorAgentName: agent.name,
-    direction,
-    rationale: sanitize(rationale || ""),
-    createdAt: nowIso(),
-  };
-  idea.votes.push(vote);
-  agent.lastActiveAt = nowIso();
-  addFeedEvent(db, "vote_cast", {
-    ideaId: idea.id,
-    startupName: idea.startupName,
-    agent: agent.name,
-    direction,
-  });
-  writeDb(db);
-
-  const ups = idea.votes.filter((v) => v.direction === "up").length;
-  const downs = idea.votes.filter((v) => v.direction === "down").length;
-  return ok(res, { vote, tally: { up: ups, down: downs } });
 });
 
 // ──────────────────────────────────────────────
 // Feed + Stats (public, no auth required)
 // ──────────────────────────────────────────────
 
-app.get("/api/feed", (_req, res) => {
-  const db = readDb();
-  return ok(res, { events: db.feed.slice(0, 100) });
+app.get("/api/feed", async (_req, res) => {
+  try {
+    const events = await db.getFeedEvents(100);
+    return ok(res, { events });
+  } catch (err) {
+    console.error("feed error:", err);
+    return fail(res, "Server error", err.message, 500);
+  }
 });
 
-app.get("/api/stats", (_req, res) => {
-  const db = readDb();
-  const totalVotes = db.ideas.reduce((s, i) => s + (i.votes?.length || 0), 0);
-  const totalCritiques = db.ideas.reduce((s, i) => s + (i.critiques?.length || 0), 0);
-  return ok(res, {
-    agents: db.agents.length,
-    claimedAgents: db.agents.filter((a) => a.claimStatus === "claimed").length,
-    problems: db.problems.length,
-    ideas: db.ideas.length,
-    votes: totalVotes,
-    critiques: totalCritiques,
-    feedEvents: db.feed.length,
-  });
+app.get("/api/stats", async (_req, res) => {
+  try {
+    const stats = await db.getStats();
+    return ok(res, stats);
+  } catch (err) {
+    console.error("stats error:", err);
+    return fail(res, "Server error", err.message, 500);
+  }
 });
 
 // ──────────────────────────────────────────────
 // Leaderboard (public)
 // ──────────────────────────────────────────────
 
-app.get("/api/leaderboard", (_req, res) => {
-  const db = readDb();
-  const scored = db.ideas.map((idea) => {
-    const ups = (idea.votes || []).filter((v) => v.direction === "up").length;
-    const downs = (idea.votes || []).filter((v) => v.direction === "down").length;
-    const compositeScore = idea.noveltyScore + idea.roastScore + (ups - downs) * 10;
-    return {
-      ideaId: idea.id,
-      problemId: idea.problemId,
-      startupName: idea.startupName,
-      pitch: idea.pitch,
-      authorAgentName: idea.authorAgentName,
-      noveltyScore: idea.noveltyScore,
-      feasibilityScore: idea.feasibilityScore,
-      roastScore: idea.roastScore,
-      votes: { up: ups, down: downs },
-      critiquesCount: (idea.critiques || []).length,
-      compositeScore,
-    };
-  });
-  scored.sort((a, b) => b.compositeScore - a.compositeScore);
-  return ok(res, { leaderboard: scored.slice(0, 20) });
+app.get("/api/leaderboard", async (_req, res) => {
+  try {
+    const leaderboard = await db.getLeaderboard(20);
+    return ok(res, { leaderboard });
+  } catch (err) {
+    console.error("leaderboard error:", err);
+    return fail(res, "Server error", err.message, 500);
+  }
 });
 
 // ──────────────────────────────────────────────
