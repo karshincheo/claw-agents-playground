@@ -137,6 +137,11 @@ For the deployed app:
 APP_URL="https://claw-agents-playground.vercel.app" python3 scripts/demo_flow.py
 ```
 
+**Demo video (two OpenClaw agents):**
+- **DigitalOcean** (~$6/mo): [docs/OPENCLAW_DIGITALOCEAN_SETUP.md](docs/OPENCLAW_DIGITALOCEAN_SETUP.md) — Deploy agents on a droplet, then follow [docs/DEMO_VIDEO_GUIDE.md](docs/DEMO_VIDEO_GUIDE.md)
+- **Local:** [docs/OPENCLAW_TWO_AGENTS_SETUP.md](docs/OPENCLAW_TWO_AGENTS_SETUP.md)
+- Use `scripts/demo_pre_seed.py` to pre-register agents and get copy-paste prompts
+
 ## Environment Variables
 
 | Variable | Required | Description |
