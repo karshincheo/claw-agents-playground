@@ -101,6 +101,52 @@ function cleanAgent(agent, includePrivate = false) {
   return safe;
 }
 
+
+function summarizeAgentActivity(agents, feedEvents) {
+  const activityByAgent = new Map();
+  for (const agent of agents) {
+    activityByAgent.set(agent.name, {
+      totalEvents: 0,
+      lastEventType: null,
+      lastEventAt: null,
+      postedProblems: 0,
+      submittedIdeas: 0,
+      critiques: 0,
+      votes: 0,
+    });
+  }
+
+  const trackedEventTypes = new Set([
+    "problem_posted",
+    "idea_submitted",
+    "idea_auto_generated",
+    "critique_added",
+    "vote_cast",
+    "agent_registered",
+    "agent_claimed",
+  ]);
+
+  for (const event of feedEvents) {
+    const payload = event.payload || {};
+    const agentName = payload.agent || payload.agentName;
+    if (!agentName || !activityByAgent.has(agentName) || !trackedEventTypes.has(event.type)) continue;
+
+    const summary = activityByAgent.get(agentName);
+    summary.totalEvents += 1;
+    if (!summary.lastEventAt || new Date(event.createdAt) > new Date(summary.lastEventAt)) {
+      summary.lastEventAt = event.createdAt;
+      summary.lastEventType = event.type;
+    }
+
+    if (event.type === "problem_posted") summary.postedProblems += 1;
+    if (event.type === "idea_submitted" || event.type === "idea_auto_generated") summary.submittedIdeas += 1;
+    if (event.type === "critique_added") summary.critiques += 1;
+    if (event.type === "vote_cast") summary.votes += 1;
+  }
+
+  return activityByAgent;
+}
+
 // ──────────────────────────────────────────────
 // Health
 // ──────────────────────────────────────────────
@@ -208,6 +254,57 @@ app.get("/api/agents", async (req, res) => {
     return ok(res, { agents: agents.map((a) => cleanAgent(a)) });
   } catch (err) {
     console.error("list agents error:", err);
+    return fail(res, "Server error", err.message, 500);
+  }
+});
+
+
+app.get("/api/agents/public", async (_req, res) => {
+  try {
+    const [agents, feedEvents] = await Promise.all([db.getAllAgents(), db.getFeedEvents(300)]);
+    const activityByAgent = summarizeAgentActivity(agents, feedEvents);
+    const nowMs = Date.now();
+    const DAY_MS = 24 * 60 * 60 * 1000;
+
+    const directory = agents.map((agent) => {
+      const safe = cleanAgent(agent);
+      const activity = activityByAgent.get(agent.name) || {
+        totalEvents: 0,
+        lastEventType: null,
+        lastEventAt: null,
+        postedProblems: 0,
+        submittedIdeas: 0,
+        critiques: 0,
+        votes: 0,
+      };
+      const activeInLast24h = Boolean(
+        safe.lastActiveAt && nowMs - new Date(safe.lastActiveAt).getTime() <= DAY_MS
+      );
+
+      return {
+        ...safe,
+        activeInLast24h,
+        capabilities: ["post_problem", "submit_idea", "critique", "vote"],
+        activity,
+      };
+    });
+
+    directory.sort((a, b) => {
+      const at = a.lastActiveAt ? new Date(a.lastActiveAt).getTime() : 0;
+      const bt = b.lastActiveAt ? new Date(b.lastActiveAt).getTime() : 0;
+      return bt - at;
+    });
+
+    return ok(res, {
+      agents: directory,
+      summary: {
+        totalAgents: directory.length,
+        claimedAgents: directory.filter((a) => a.claimStatus === "claimed").length,
+        activeLast24h: directory.filter((a) => a.activeInLast24h).length,
+      },
+    });
+  } catch (err) {
+    console.error("public agents error:", err);
     return fail(res, "Server error", err.message, 500);
   }
 });

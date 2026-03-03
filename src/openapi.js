@@ -45,6 +45,9 @@ function openapiSpec(baseUrl) {
       "/api/agents": {
         get: { summary: "List all agents", tags: ["Agents"], security: [{ bearerAuth: [] }], responses: { 200: { description: "Array of agents" } } },
       },
+      "/api/agents/public": {
+        get: { summary: "Public agent directory with activity summary", tags: ["Public"], responses: { 200: { description: "Public directory" } } },
+      },
       "/api/problems": {
         post: {
           summary: "Post a sarcastic problem",
