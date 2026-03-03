@@ -4,6 +4,7 @@ const express = require("express");
 const cors = require("cors");
 const { nanoid } = require("nanoid");
 const path = require("path");
+const crypto = require("crypto");
 const db = require("./datastore");
 const {
   getBaseUrl,
@@ -32,6 +33,45 @@ const port = process.env.PORT || 3000;
 app.use(cors());
 app.use(express.json({ limit: "1mb" }));
 app.use(express.static(path.join(process.cwd(), "public")));
+
+const processStartedAt = Date.now();
+const opsMetrics = {
+  requests: 0,
+  errors4xx: 0,
+  errors5xx: 0,
+  lastErrorAt: null,
+};
+
+app.use((req, res, next) => {
+  const start = Date.now();
+  const requestId = req.headers["x-request-id"] || `req_${nanoid(10)}`;
+  req.requestId = requestId;
+  res.setHeader("X-Request-Id", requestId);
+
+  res.on("finish", () => {
+    opsMetrics.requests += 1;
+    if (res.statusCode >= 500) {
+      opsMetrics.errors5xx += 1;
+      opsMetrics.lastErrorAt = new Date().toISOString();
+    } else if (res.statusCode >= 400) {
+      opsMetrics.errors4xx += 1;
+    }
+    const durationMs = Date.now() - start;
+    const log = {
+      requestId,
+      method: req.method,
+      path: req.originalUrl,
+      status: res.statusCode,
+      durationMs,
+    };
+    if (res.statusCode >= 400) {
+      console.error(JSON.stringify(log));
+    } else {
+      console.log(JSON.stringify(log));
+    }
+  });
+  next();
+});
 
 const rateBuckets = new Map();
 const RATE_WINDOW_MS = 60_000;
@@ -64,10 +104,76 @@ function ok(res, data, status = 200) {
   return res.status(status).json({ success: true, data });
 }
 
-function fail(res, error, hint, status = 400, code) {
+function fail(res, error, hint, status = 400, code, requestId) {
   const body = { success: false, error, hint };
   if (code) body.code = code;
+  if (requestId) body.requestId = requestId;
   return res.status(status).json(body);
+}
+
+function getCurrentChallengeTag(now = new Date()) {
+  const year = now.getUTCFullYear();
+  const month = String(now.getUTCMonth() + 1).padStart(2, "0");
+  const day = String(now.getUTCDate()).padStart(2, "0");
+  return `daily-${year}${month}${day}`;
+}
+
+function summarizeChallenge(ideas) {
+  const tag = getCurrentChallengeTag();
+  const challengeIdeas = (ideas || []).filter((i) => (i.challengeTag || tag) === tag);
+  const top = challengeIdeas
+    .map((idea) => {
+      const ups = (idea.votes || []).filter((v) => v.direction === "up").length;
+      const downs = (idea.votes || []).filter((v) => v.direction === "down").length;
+      const score = (idea.noveltyScore || 0) + (idea.roastScore || 0) + (ups - downs) * 10;
+      return {
+        ideaId: idea.id,
+        startupName: idea.startupName,
+        authorAgentName: idea.authorAgentName,
+        score,
+      };
+    })
+    .sort((a, b) => b.score - a.score)
+    .slice(0, 5);
+  return {
+    tag,
+    totalIdeas: challengeIdeas.length,
+    top,
+  };
+}
+
+const idempotencyCache = new Map();
+const IDEMPOTENCY_TTL_MS = 10 * 60 * 1000;
+
+function getIdempotencyKey(req) {
+  const key = req.headers["x-idempotency-key"];
+  if (!key) return null;
+  const auth = req.headers.authorization || "anon";
+  const scope = `${req.method}:${req.path}:${auth}`;
+  return `${scope}:${String(key)}`;
+}
+
+function maybeReplayIdempotent(req, res) {
+  const cacheKey = getIdempotencyKey(req);
+  if (!cacheKey) return false;
+  const cached = idempotencyCache.get(cacheKey);
+  if (!cached) return false;
+  if (Date.now() - cached.at > IDEMPOTENCY_TTL_MS) {
+    idempotencyCache.delete(cacheKey);
+    return false;
+  }
+  res.setHeader("X-Idempotent-Replay", "true");
+  return res.status(cached.status).json(cached.body);
+}
+
+function storeIdempotent(req, status, body) {
+  const cacheKey = getIdempotencyKey(req);
+  if (!cacheKey) return;
+  idempotencyCache.set(cacheKey, {
+    at: Date.now(),
+    status,
+    body,
+  });
 }
 
 async function authAgent(req, res) {
@@ -152,7 +258,13 @@ function summarizeAgentActivity(agents, feedEvents) {
 // ──────────────────────────────────────────────
 
 app.get("/api/health", (_req, res) =>
-  ok(res, { status: "ok", service: "startup-roast-playground" })
+  ok(res, {
+    status: "ok",
+    service: "startup-roast-playground",
+    uptimeSeconds: Math.floor((Date.now() - processStartedAt) / 1000),
+    backend: db.getBackendStatus(),
+    ops: opsMetrics,
+  })
 );
 
 // ──────────────────────────────────────────────
@@ -160,14 +272,15 @@ app.get("/api/health", (_req, res) =>
 // ──────────────────────────────────────────────
 
 app.post("/api/agents/register", async (req, res) => {
+  if (maybeReplayIdempotent(req, res)) return;
   try {
     const { name, description } = req.body || {};
     if (!name || !description) {
-      return fail(res, "Missing fields", "Both name and description are required", 400);
+      return fail(res, "Missing fields", "Both name and description are required", 400, undefined, req.requestId);
     }
     const dup = await db.agentNameExists(String(name));
     if (dup) {
-      return fail(res, "Name already taken", "Choose another agent name", 409);
+      return fail(res, "Name already taken", "Choose another agent name", 409, undefined, req.requestId);
     }
 
     const agent = {
@@ -182,12 +295,12 @@ app.post("/api/agents/register", async (req, res) => {
     };
 
     await db.insertAgent(agent);
-    const baseUrl = process.env.APP_URL || `${req.protocol}://${req.get("host")}`;
+    const baseUrl = getBaseUrl(req);
     await db.addFeedEvent("agent_registered", { agentName: agent.name });
 
-    return ok(
-      res,
-      {
+    const body = {
+      success: true,
+      data: {
         agent: {
           id: agent.id,
           name: agent.name,
@@ -196,8 +309,9 @@ app.post("/api/agents/register", async (req, res) => {
         },
         important: "Save api_key now. It is only shown at registration.",
       },
-      201
-    );
+    };
+    storeIdempotent(req, 201, body);
+    return res.status(201).json(body);
   } catch (err) {
     console.error("register error:", err);
     return fail(res, "Server error", err.message, 500);
@@ -205,13 +319,19 @@ app.post("/api/agents/register", async (req, res) => {
 });
 
 app.post("/api/agents/claim/:token", async (req, res) => {
+  if (maybeReplayIdempotent(req, res)) return;
   try {
     const agent = await db.getAgentByClaimToken(req.params.token);
     if (!agent) return fail(res, "Invalid claim token", "Use a valid claim link", 404);
+    const wasClaimed = agent.claimStatus === "claimed";
     await db.updateAgent(agent.id, { claimStatus: "claimed", lastActiveAt: db.nowIso() });
-    await db.addFeedEvent("agent_claimed", { agentName: agent.name });
+    if (!wasClaimed) {
+      await db.addFeedEvent("agent_claimed", { agentName: agent.name });
+    }
     agent.claimStatus = "claimed";
-    return ok(res, { agent: cleanAgent(agent) });
+    const body = { success: true, data: { agent: cleanAgent(agent), idempotent: wasClaimed } };
+    storeIdempotent(req, 200, body);
+    return res.status(200).json(body);
   } catch (err) {
     console.error("claim error:", err);
     return fail(res, "Server error", err.message, 500);
@@ -295,12 +415,20 @@ app.get("/api/agents/public", async (_req, res) => {
       return bt - at;
     });
 
+    const now = Date.now();
+    const HOUR_MS = 60 * 60 * 1000;
+    const MIN10_MS = 10 * 60 * 1000;
+    const interactionsLast24h = feedEvents.filter((e) => ["idea_submitted", "idea_auto_generated", "critique_added", "vote_cast"].includes(e.type)).length;
+
     return ok(res, {
       agents: directory,
       summary: {
         totalAgents: directory.length,
         claimedAgents: directory.filter((a) => a.claimStatus === "claimed").length,
         activeLast24h: directory.filter((a) => a.activeInLast24h).length,
+        activeLast60m: directory.filter((a) => a.lastActiveAt && now - new Date(a.lastActiveAt).getTime() <= HOUR_MS).length,
+        activeLast10m: directory.filter((a) => a.lastActiveAt && now - new Date(a.lastActiveAt).getTime() <= MIN10_MS).length,
+        interactionsLast24h,
       },
     });
   } catch (err) {
@@ -328,6 +456,7 @@ app.get("/api/agents/:name", async (req, res) => {
 // ──────────────────────────────────────────────
 
 app.post("/api/problems", async (req, res) => {
+  if (maybeReplayIdempotent(req, res)) return;
   try {
     const agent = await authAgent(req, res);
     if (!agent) return;
@@ -354,6 +483,7 @@ app.post("/api/problems", async (req, res) => {
       severity: isValidSeverity(severity) ? severity : "annoying",
       createdAt: db.nowIso(),
       ideaCount: 0,
+      challengeTag: getCurrentChallengeTag(),
     };
 
     await db.insertProblem(problem);
@@ -364,8 +494,11 @@ app.post("/api/problems", async (req, res) => {
       title: problem.title,
       roast: problem.roastDescription.slice(0, 160),
       severity: problem.severity,
+      challengeTag: problem.challengeTag,
     });
-    return ok(res, { problem }, 201);
+    const body = { success: true, data: { problem } };
+    storeIdempotent(req, 201, body);
+    return res.status(201).json(body);
   } catch (err) {
     console.error("post problem error:", err);
     return fail(res, "Server error", err.message, 500);
@@ -406,6 +539,7 @@ app.get("/api/problems/:id", async (req, res) => {
 // ──────────────────────────────────────────────
 
 app.post("/api/problems/:id/ideas", async (req, res) => {
+  if (maybeReplayIdempotent(req, res)) return;
   try {
     const agent = await authAgent(req, res);
     if (!agent) return;
@@ -417,8 +551,11 @@ app.post("/api/problems/:id/ideas", async (req, res) => {
       return fail(res, "Missing fields", "Provide startupName and pitch", 400);
     }
     const pitchCheck = checkContentSafety(pitch);
-    if (!pitchCheck.safe) {
-      return fail(res, "Content flagged", `Moderation reason: ${pitchCheck.reason}. Rephrase and resubmit.`, 422, `MODERATION_${pitchCheck.reason.toUpperCase()}`);
+    const startupCheck = checkContentSafety(startupName);
+    const modelCheck = checkContentSafety(businessModel || "");
+    if (!pitchCheck.safe || !startupCheck.safe || !modelCheck.safe) {
+      const reason = pitchCheck.reason || startupCheck.reason || modelCheck.reason;
+      return fail(res, "Content flagged", `Moderation reason: ${reason}. Rephrase and resubmit.`, 422, `MODERATION_${reason.toUpperCase()}`, req.requestId);
     }
 
     const existingIdeas = await db.getIdeasByProblem(problem.id);
@@ -438,6 +575,7 @@ app.post("/api/problems/:id/ideas", async (req, res) => {
       createdAt: db.nowIso(),
       critiques: [],
       votes: [],
+      challengeTag: problem.challengeTag || getCurrentChallengeTag(),
     };
 
     await db.insertIdea(idea);
@@ -450,8 +588,11 @@ app.post("/api/problems/:id/ideas", async (req, res) => {
       startupName: idea.startupName,
       pitch: idea.pitch.slice(0, 140),
       noveltyScore: idea.noveltyScore,
+      challengeTag: idea.challengeTag,
     });
-    return ok(res, { idea }, 201);
+    const body = { success: true, data: { idea } };
+    storeIdempotent(req, 201, body);
+    return res.status(201).json(body);
   } catch (err) {
     console.error("submit idea error:", err);
     return fail(res, "Server error", err.message, 500);
@@ -479,6 +620,7 @@ app.get("/api/problems/:id/ideas", async (req, res) => {
 // ──────────────────────────────────────────────
 
 app.post("/api/problems/:id/auto-brainstorm", async (req, res) => {
+  if (maybeReplayIdempotent(req, res)) return;
   try {
     const agent = await authAgent(req, res);
     if (!agent) return;
@@ -511,6 +653,7 @@ app.post("/api/problems/:id/auto-brainstorm", async (req, res) => {
         createdAt: db.nowIso(),
         critiques: [],
         votes: [],
+        challengeTag: problem.challengeTag || getCurrentChallengeTag(),
       };
       generated.push(idea);
       await db.insertIdea(idea);
@@ -523,11 +666,14 @@ app.post("/api/problems/:id/auto-brainstorm", async (req, res) => {
         pitch: idea.pitch.slice(0, 140),
         source: idea.source,
         noveltyScore: idea.noveltyScore,
+        challengeTag: idea.challengeTag,
       });
     }
 
     await db.updateAgent(agent.id, { lastActiveAt: db.nowIso() });
-    return ok(res, { ideas: generated }, 201);
+    const body = { success: true, data: { ideas: generated } };
+    storeIdempotent(req, 201, body);
+    return res.status(201).json(body);
   } catch (err) {
     console.error("auto-brainstorm error:", err);
     return fail(res, "Server error", err.message, 500);
@@ -539,6 +685,7 @@ app.post("/api/problems/:id/auto-brainstorm", async (req, res) => {
 // ──────────────────────────────────────────────
 
 app.post("/api/ideas/:id/critique", async (req, res) => {
+  if (maybeReplayIdempotent(req, res)) return;
   try {
     const agent = await authAgent(req, res);
     if (!agent) return;
@@ -567,7 +714,9 @@ app.post("/api/ideas/:id/critique", async (req, res) => {
       agent: agent.name,
       text: critique.text.slice(0, 120),
     });
-    return ok(res, { critique }, 201);
+    const body = { success: true, data: { critique } };
+    storeIdempotent(req, 201, body);
+    return res.status(201).json(body);
   } catch (err) {
     console.error("critique error:", err);
     return fail(res, "Server error", err.message, 500);
@@ -579,6 +728,7 @@ app.post("/api/ideas/:id/critique", async (req, res) => {
 // ──────────────────────────────────────────────
 
 app.post("/api/ideas/:id/vote", async (req, res) => {
+  if (maybeReplayIdempotent(req, res)) return;
   try {
     const agent = await authAgent(req, res);
     if (!agent) return;
@@ -588,6 +738,11 @@ app.post("/api/ideas/:id/vote", async (req, res) => {
     const { direction, rationale } = req.body || {};
     if (!direction || !["up", "down"].includes(direction)) {
       return fail(res, "Invalid vote", "direction must be 'up' or 'down'", 400);
+    }
+
+    const rationaleCheck = checkContentSafety(rationale || "");
+    if (!rationaleCheck.safe) {
+      return fail(res, "Content flagged", `Moderation reason: ${rationaleCheck.reason}. Rephrase and resubmit.`, 422, `MODERATION_${rationaleCheck.reason.toUpperCase()}`, req.requestId);
     }
 
     const vote = {
@@ -608,7 +763,9 @@ app.post("/api/ideas/:id/vote", async (req, res) => {
     });
 
     const tally = await db.getVoteTally(idea.id);
-    return ok(res, { vote, tally });
+    const body = { success: true, data: { vote, tally } };
+    storeIdempotent(req, 200, body);
+    return res.status(200).json(body);
   } catch (err) {
     console.error("vote error:", err);
     return fail(res, "Server error", err.message, 500);
@@ -653,6 +810,25 @@ app.get("/api/leaderboard", async (_req, res) => {
   }
 });
 
+
+app.get("/api/challenge", async (_req, res) => {
+  try {
+    const ideas = await db.getAllIdeas();
+    return ok(res, summarizeChallenge(ideas));
+  } catch (err) {
+    console.error("challenge error:", err);
+    return fail(res, "Server error", err.message, 500);
+  }
+});
+
+app.get("/api/ops", (_req, res) => {
+  return ok(res, {
+    uptimeSeconds: Math.floor((Date.now() - processStartedAt) / 1000),
+    backend: db.getBackendStatus(),
+    ops: opsMetrics,
+  });
+});
+
 // ──────────────────────────────────────────────
 // OpenAPI spec
 // ──────────────────────────────────────────────
@@ -669,9 +845,11 @@ app.get("/api/grader", async (_req, res) => {
   try {
     const stats = await db.getStats();
     const agents = await db.getAllAgents();
+    const backend = db.getBackendStatus();
     const claimedAgents = agents.filter((a) => a.claimStatus === "claimed");
 
     const allIdeas = await db.getAllIdeas();
+    const challenge = summarizeChallenge(allIdeas);
     const crossAgentCritiques = allIdeas.reduce((count, idea) => {
       return count + (idea.critiques || []).filter((c) => c.authorAgentId !== idea.authorAgentId).length;
     }, 0);
@@ -690,7 +868,7 @@ app.get("/api/grader", async (_req, res) => {
       crossAgentActivity: crossAgentCritiques + crossAgentVotes >= 2,
       votesPresent: stats.votes >= 2,
       critiquesPresent: stats.critiques >= 1,
-      persistentStorage: true,
+      persistentStorage: backend.mode === "supabase" && !backend.supabaseDegraded,
     };
     const passCount = Object.values(checks).filter(Boolean).length;
     const totalChecks = Object.keys(checks).length;
@@ -708,7 +886,12 @@ app.get("/api/grader", async (_req, res) => {
         crossAgentCritiques,
         crossAgentVotes,
         feedEvents: stats.feedEvents,
+        challengeTag: challenge.tag,
+        challengeIdeas: challenge.totalIdeas,
       },
+      backend,
+      ops: { ...opsMetrics, uptimeSeconds: Math.floor((Date.now() - processStartedAt) / 1000) },
+      challenge,
     });
   } catch (err) {
     console.error("grader error:", err);

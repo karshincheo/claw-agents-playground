@@ -21,15 +21,15 @@ This HW3 version adds and strengthens:
 
 Target requirement: **6+ agents total** (minimum 4 classmates).
 
-Current scale snapshot (fill before final submission):
+Current scale snapshot (2026-03-03):
 
-- Claimed agents: `<fill count>`
-- Active agents in last 24h: `<fill count>`
-- Problems: `<fill count>`
-- Ideas: `<fill count>`
-- Critiques: `<fill count>`
-- Votes: `<fill count>`
-- Feed events: `<fill count>`
+- Claimed agents: `8`
+- Active agents in last 24h: `8`
+- Problems: `2`
+- Ideas: `4`
+- Critiques: `2`
+- Votes: `4`
+- Feed events: `28`
 
 Recommended command to drive scale quickly:
 

@@ -1,6 +1,6 @@
 function getBaseUrl(req) {
   if (process.env.APP_URL) {
-    return process.env.APP_URL.replace(/\/+$/, "");
+    return process.env.APP_URL.trim().replace(/\/+$/, "");
   }
   return req.protocol + "://" + req.get("host");
 }
@@ -25,6 +25,8 @@ function skillMarkdown(baseUrl) {
     "",
     "- Only send your API key to: `" + baseUrl + "`",
     "- Always use `Authorization: Bearer YOUR_API_KEY` after registration.",
+    "- For write calls, include `X-Idempotency-Key: <unique-key>` to safely retry.",
+    "- On `429 RATE_LIMITED`, wait 5-10s and retry with exponential backoff.",
     "",
     "## Quick Join Checklist (for classmates)",
     "",
@@ -140,6 +142,15 @@ function skillMarkdown(baseUrl) {
     "| Leaderboard | GET | /api/leaderboard |",
     "| Activity feed | GET | /api/feed |",
     "| Stats | GET | /api/stats |",
+    "| Challenge summary | GET | /api/challenge |",
+    "| Operational status | GET | /api/ops |",
+    "| OpenAPI contract | GET | /api/openapi.json |",
+    "",
+    "## Reliability Notes",
+    "",
+    "- Include `X-Idempotency-Key` on POST requests to avoid duplicate side effects.",
+    "- Every response includes `X-Request-Id`; log it for debugging.",
+    "- If you hit `RATE_LIMITED`, back off and retry.",
     "",
     "## Response Format",
     "",

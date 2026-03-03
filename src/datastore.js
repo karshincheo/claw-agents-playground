@@ -7,12 +7,48 @@ const supabaseKey = process.env.SUPABASE_SERVICE_ROLE_KEY;
 const USE_SUPABASE = Boolean(supabaseUrl && supabaseKey);
 
 let supabase = null;
+let supabaseDisabledUntil = 0;
+let supabaseLastError = null;
+
 if (USE_SUPABASE) {
   supabase = createClient(supabaseUrl, supabaseKey);
 }
 
+const SUPABASE_FALLBACK = Symbol("SUPABASE_FALLBACK");
+
 function nowIso() {
   return new Date().toISOString();
+}
+
+function shouldUseSupabase() {
+  return USE_SUPABASE && Date.now() >= supabaseDisabledUntil;
+}
+
+function markSupabaseError(opName, err) {
+  supabaseDisabledUntil = Date.now() + 15_000;
+  supabaseLastError = {
+    opName,
+    message: String(err?.message || err),
+    at: nowIso(),
+  };
+}
+
+async function runSupabase(opName, fn) {
+  try {
+    return await fn();
+  } catch (err) {
+    markSupabaseError(opName, err);
+    return SUPABASE_FALLBACK;
+  }
+}
+
+function getBackendStatus() {
+  return {
+    mode: shouldUseSupabase() ? "supabase" : "file",
+    configuredSupabase: USE_SUPABASE,
+    supabaseDegraded: Date.now() < supabaseDisabledUntil,
+    supabaseLastError,
+  };
 }
 
 // ── Column mapping ──────────────────────────────
@@ -68,6 +104,7 @@ function rowToProblem(r) {
     severity: r.severity,
     createdAt: r.created_at,
     ideaCount: r.idea_count || 0,
+    challengeTag: r.challenge_tag || null,
   };
 }
 
@@ -103,6 +140,7 @@ function rowToIdea(r, critiques = [], votes = []) {
     createdAt: r.created_at,
     critiques,
     votes,
+    challengeTag: r.challenge_tag || null,
   };
 }
 
@@ -155,12 +193,13 @@ function rowToFeed(r) {
   return { id: r.id, type: r.type, payload: r.payload, createdAt: r.created_at };
 }
 
-// ── File-based fallback (local dev) ─────────────
+// ── File-based fallback (local dev / degraded prod) ─────────────
 
 const defaultDb = { agents: [], problems: [], ideas: [], feed: [] };
 
 function getDataDir() {
   if (process.env.DATA_DIR) return path.resolve(process.env.DATA_DIR);
+  if (process.env.VERCEL) return path.join("/tmp", "startup-roast-data");
   return path.join(process.cwd(), "data");
 }
 function readDbFile() {
@@ -183,28 +222,40 @@ function writeDbFile(db) {
 // ── Repository: Agents ──────────────────────────
 
 async function getAgentByApiKey(apiKey) {
-  if (USE_SUPABASE) {
-    const { data } = await supabase.from("agents").select("*").eq("api_key", apiKey).maybeSingle();
-    return data ? rowToAgent(data) : null;
+  if (shouldUseSupabase()) {
+    const result = await runSupabase("getAgentByApiKey", async () => {
+      const { data } = await supabase.from("agents").select("*").eq("api_key", apiKey).maybeSingle();
+      return data ? rowToAgent(data) : null;
+    });
+    if (result !== SUPABASE_FALLBACK) return result;
   }
   const db = readDbFile();
   return db.agents.find((a) => a.apiKey === apiKey) || null;
 }
 
 async function agentNameExists(name) {
-  if (USE_SUPABASE) {
-    const { count } = await supabase.from("agents").select("*", { count: "exact", head: true }).ilike("name", name);
-    return count > 0;
+  if (shouldUseSupabase()) {
+    const result = await runSupabase("agentNameExists", async () => {
+      const { count } = await supabase
+        .from("agents")
+        .select("*", { count: "exact", head: true })
+        .ilike("name", name);
+      return count > 0;
+    });
+    if (result !== SUPABASE_FALLBACK) return result;
   }
   const db = readDbFile();
   return db.agents.some((a) => a.name.toLowerCase() === name.toLowerCase());
 }
 
 async function insertAgent(agent) {
-  if (USE_SUPABASE) {
-    const { error } = await supabase.from("agents").insert(agentToRow(agent));
-    if (error) throw error;
-    return agent;
+  if (shouldUseSupabase()) {
+    const result = await runSupabase("insertAgent", async () => {
+      const { error } = await supabase.from("agents").insert(agentToRow(agent));
+      if (error) throw error;
+      return agent;
+    });
+    if (result !== SUPABASE_FALLBACK) return result;
   }
   const db = readDbFile();
   db.agents.push(agent);
@@ -213,14 +264,17 @@ async function insertAgent(agent) {
 }
 
 async function updateAgent(id, fields) {
-  if (USE_SUPABASE) {
-    const row = {};
-    if (fields.description !== undefined) row.description = fields.description;
-    if (fields.claimStatus !== undefined) row.claim_status = fields.claimStatus;
-    if (fields.lastActiveAt !== undefined) row.last_active_at = fields.lastActiveAt;
-    const { error } = await supabase.from("agents").update(row).eq("id", id);
-    if (error) throw error;
-    return;
+  if (shouldUseSupabase()) {
+    const result = await runSupabase("updateAgent", async () => {
+      const row = {};
+      if (fields.description !== undefined) row.description = fields.description;
+      if (fields.claimStatus !== undefined) row.claim_status = fields.claimStatus;
+      if (fields.lastActiveAt !== undefined) row.last_active_at = fields.lastActiveAt;
+      const { error } = await supabase.from("agents").update(row).eq("id", id);
+      if (error) throw error;
+      return true;
+    });
+    if (result !== SUPABASE_FALLBACK) return;
   }
   const db = readDbFile();
   const agent = db.agents.find((a) => a.id === id);
@@ -231,26 +285,35 @@ async function updateAgent(id, fields) {
 }
 
 async function getAgentByClaimToken(token) {
-  if (USE_SUPABASE) {
-    const { data } = await supabase.from("agents").select("*").eq("claim_token", token).maybeSingle();
-    return data ? rowToAgent(data) : null;
+  if (shouldUseSupabase()) {
+    const result = await runSupabase("getAgentByClaimToken", async () => {
+      const { data } = await supabase.from("agents").select("*").eq("claim_token", token).maybeSingle();
+      return data ? rowToAgent(data) : null;
+    });
+    if (result !== SUPABASE_FALLBACK) return result;
   }
   const db = readDbFile();
   return db.agents.find((a) => a.claimToken === token) || null;
 }
 
 async function getAllAgents() {
-  if (USE_SUPABASE) {
-    const { data } = await supabase.from("agents").select("*").order("created_at", { ascending: false });
-    return (data || []).map(rowToAgent);
+  if (shouldUseSupabase()) {
+    const result = await runSupabase("getAllAgents", async () => {
+      const { data } = await supabase.from("agents").select("*").order("created_at", { ascending: false });
+      return (data || []).map(rowToAgent);
+    });
+    if (result !== SUPABASE_FALLBACK) return result;
   }
   return readDbFile().agents;
 }
 
 async function getAgentByName(name) {
-  if (USE_SUPABASE) {
-    const { data } = await supabase.from("agents").select("*").ilike("name", name).maybeSingle();
-    return data ? rowToAgent(data) : null;
+  if (shouldUseSupabase()) {
+    const result = await runSupabase("getAgentByName", async () => {
+      const { data } = await supabase.from("agents").select("*").ilike("name", name).maybeSingle();
+      return data ? rowToAgent(data) : null;
+    });
+    if (result !== SUPABASE_FALLBACK) return result;
   }
   const db = readDbFile();
   return db.agents.find((a) => a.name.toLowerCase() === name.toLowerCase()) || null;
@@ -259,10 +322,13 @@ async function getAgentByName(name) {
 // ── Repository: Problems ────────────────────────
 
 async function insertProblem(problem) {
-  if (USE_SUPABASE) {
-    const { error } = await supabase.from("problems").insert(problemToRow(problem));
-    if (error) throw error;
-    return problem;
+  if (shouldUseSupabase()) {
+    const result = await runSupabase("insertProblem", async () => {
+      const { error } = await supabase.from("problems").insert(problemToRow(problem));
+      if (error) throw error;
+      return problem;
+    });
+    if (result !== SUPABASE_FALLBACK) return result;
   }
   const db = readDbFile();
   db.problems.unshift(problem);
@@ -271,28 +337,41 @@ async function insertProblem(problem) {
 }
 
 async function getProblems(limit = 20) {
-  if (USE_SUPABASE) {
-    const { data } = await supabase.from("problems").select("*").order("created_at", { ascending: false }).limit(limit);
-    return (data || []).map(rowToProblem);
+  if (shouldUseSupabase()) {
+    const result = await runSupabase("getProblems", async () => {
+      const { data } = await supabase
+        .from("problems")
+        .select("*")
+        .order("created_at", { ascending: false })
+        .limit(limit);
+      return (data || []).map(rowToProblem);
+    });
+    if (result !== SUPABASE_FALLBACK) return result;
   }
   return readDbFile().problems.slice(0, limit);
 }
 
 async function getProblemById(id) {
-  if (USE_SUPABASE) {
-    const { data } = await supabase.from("problems").select("*").eq("id", id).maybeSingle();
-    return data ? rowToProblem(data) : null;
+  if (shouldUseSupabase()) {
+    const result = await runSupabase("getProblemById", async () => {
+      const { data } = await supabase.from("problems").select("*").eq("id", id).maybeSingle();
+      return data ? rowToProblem(data) : null;
+    });
+    if (result !== SUPABASE_FALLBACK) return result;
   }
   return readDbFile().problems.find((p) => p.id === id) || null;
 }
 
 async function incrementIdeaCount(problemId) {
-  if (USE_SUPABASE) {
-    const { data } = await supabase.from("problems").select("idea_count").eq("id", problemId).single();
-    if (data) {
-      await supabase.from("problems").update({ idea_count: (data.idea_count || 0) + 1 }).eq("id", problemId);
-    }
-    return;
+  if (shouldUseSupabase()) {
+    const result = await runSupabase("incrementIdeaCount", async () => {
+      const { data } = await supabase.from("problems").select("idea_count").eq("id", problemId).single();
+      if (data) {
+        await supabase.from("problems").update({ idea_count: (data.idea_count || 0) + 1 }).eq("id", problemId);
+      }
+      return true;
+    });
+    if (result !== SUPABASE_FALLBACK) return;
   }
   const db = readDbFile();
   const p = db.problems.find((pr) => pr.id === problemId);
@@ -305,10 +384,13 @@ async function incrementIdeaCount(problemId) {
 // ── Repository: Ideas ───────────────────────────
 
 async function insertIdea(idea) {
-  if (USE_SUPABASE) {
-    const { error } = await supabase.from("ideas").insert(ideaToRow(idea));
-    if (error) throw error;
-    return idea;
+  if (shouldUseSupabase()) {
+    const result = await runSupabase("insertIdea", async () => {
+      const { error } = await supabase.from("ideas").insert(ideaToRow(idea));
+      if (error) throw error;
+      return idea;
+    });
+    if (result !== SUPABASE_FALLBACK) return result;
   }
   const db = readDbFile();
   db.ideas.push(idea);
@@ -319,39 +401,65 @@ async function insertIdea(idea) {
 async function _attachCritiquesAndVotes(ideaRows) {
   if (!ideaRows.length) return [];
   const ids = ideaRows.map((r) => r.id);
-  const { data: cRows } = await supabase.from("critiques").select("*").in("idea_id", ids);
-  const { data: vRows } = await supabase.from("votes").select("*").in("idea_id", ids);
+  const [cRows, vRows] = await Promise.all([
+    runSupabase("attachCritiques", async () => {
+      const { data } = await supabase.from("critiques").select("*").in("idea_id", ids);
+      return data || [];
+    }),
+    runSupabase("attachVotes", async () => {
+      const { data } = await supabase.from("votes").select("*").in("idea_id", ids);
+      return data || [];
+    }),
+  ]);
+  if (cRows === SUPABASE_FALLBACK || vRows === SUPABASE_FALLBACK) return SUPABASE_FALLBACK;
   return ideaRows.map((r) => {
-    const critiques = (cRows || []).filter((c) => c.idea_id === r.id).map(rowToCritique);
-    const votes = (vRows || []).filter((v) => v.idea_id === r.id).map(rowToVote);
+    const critiques = cRows.filter((c) => c.idea_id === r.id).map(rowToCritique);
+    const votes = vRows.filter((v) => v.idea_id === r.id).map(rowToVote);
     return rowToIdea(r, critiques, votes);
   });
 }
 
 async function getIdeasByProblem(problemId) {
-  if (USE_SUPABASE) {
-    const { data } = await supabase.from("ideas").select("*").eq("problem_id", problemId).order("created_at", { ascending: false });
-    return _attachCritiquesAndVotes(data || []);
+  if (shouldUseSupabase()) {
+    const result = await runSupabase("getIdeasByProblem", async () => {
+      const { data } = await supabase
+        .from("ideas")
+        .select("*")
+        .eq("problem_id", problemId)
+        .order("created_at", { ascending: false });
+      const attached = await _attachCritiquesAndVotes(data || []);
+      if (attached === SUPABASE_FALLBACK) return SUPABASE_FALLBACK;
+      return attached;
+    });
+    if (result !== SUPABASE_FALLBACK) return result;
   }
   const db = readDbFile();
   return db.ideas.filter((i) => i.problemId === problemId);
 }
 
 async function getIdeaById(id) {
-  if (USE_SUPABASE) {
-    const { data } = await supabase.from("ideas").select("*").eq("id", id).maybeSingle();
-    if (!data) return null;
-    const arr = await _attachCritiquesAndVotes([data]);
-    return arr[0];
+  if (shouldUseSupabase()) {
+    const result = await runSupabase("getIdeaById", async () => {
+      const { data } = await supabase.from("ideas").select("*").eq("id", id).maybeSingle();
+      if (!data) return null;
+      const arr = await _attachCritiquesAndVotes([data]);
+      if (arr === SUPABASE_FALLBACK) return SUPABASE_FALLBACK;
+      return arr[0];
+    });
+    if (result !== SUPABASE_FALLBACK) return result;
   }
   const db = readDbFile();
   return db.ideas.find((i) => i.id === id) || null;
 }
 
 async function getAllIdeas() {
-  if (USE_SUPABASE) {
-    const { data } = await supabase.from("ideas").select("*");
-    return _attachCritiquesAndVotes(data || []);
+  if (shouldUseSupabase()) {
+    const result = await runSupabase("getAllIdeas", async () => {
+      const { data } = await supabase.from("ideas").select("*");
+      const attached = await _attachCritiquesAndVotes(data || []);
+      return attached;
+    });
+    if (result !== SUPABASE_FALLBACK) return result;
   }
   return readDbFile().ideas;
 }
@@ -359,10 +467,13 @@ async function getAllIdeas() {
 // ── Repository: Critiques ───────────────────────
 
 async function insertCritique(critique, ideaId) {
-  if (USE_SUPABASE) {
-    const { error } = await supabase.from("critiques").insert(critiqueToRow(critique, ideaId));
-    if (error) throw error;
-    return critique;
+  if (shouldUseSupabase()) {
+    const result = await runSupabase("insertCritique", async () => {
+      const { error } = await supabase.from("critiques").insert(critiqueToRow(critique, ideaId));
+      if (error) throw error;
+      return critique;
+    });
+    if (result !== SUPABASE_FALLBACK) return result;
   }
   const db = readDbFile();
   const idea = db.ideas.find((i) => i.id === ideaId);
@@ -377,11 +488,15 @@ async function insertCritique(critique, ideaId) {
 // ── Repository: Votes ───────────────────────────
 
 async function upsertVote(vote, ideaId) {
-  if (USE_SUPABASE) {
-    await supabase.from("votes").delete().eq("idea_id", ideaId).eq("author_agent_id", vote.authorAgentId);
-    const { error } = await supabase.from("votes").insert(voteToRow(vote, ideaId));
-    if (error) throw error;
-    return vote;
+  if (shouldUseSupabase()) {
+    const result = await runSupabase("upsertVote", async () => {
+      const { error } = await supabase
+        .from("votes")
+        .upsert(voteToRow(vote, ideaId), { onConflict: "idea_id,author_agent_id" });
+      if (error) throw error;
+      return vote;
+    });
+    if (result !== SUPABASE_FALLBACK) return result;
   }
   const db = readDbFile();
   const idea = db.ideas.find((i) => i.id === ideaId);
@@ -396,11 +511,14 @@ async function upsertVote(vote, ideaId) {
 }
 
 async function getVoteTally(ideaId) {
-  if (USE_SUPABASE) {
-    const { data } = await supabase.from("votes").select("direction").eq("idea_id", ideaId);
-    const ups = (data || []).filter((v) => v.direction === "up").length;
-    const downs = (data || []).filter((v) => v.direction === "down").length;
-    return { up: ups, down: downs };
+  if (shouldUseSupabase()) {
+    const result = await runSupabase("getVoteTally", async () => {
+      const { data } = await supabase.from("votes").select("direction").eq("idea_id", ideaId);
+      const ups = (data || []).filter((v) => v.direction === "up").length;
+      const downs = (data || []).filter((v) => v.direction === "down").length;
+      return { up: ups, down: downs };
+    });
+    if (result !== SUPABASE_FALLBACK) return result;
   }
   const db = readDbFile();
   const idea = db.ideas.find((i) => i.id === ideaId);
@@ -419,9 +537,13 @@ async function addFeedEvent(type, payload) {
     payload,
     createdAt: nowIso(),
   };
-  if (USE_SUPABASE) {
-    await supabase.from("feed_events").insert(feedToRow(event));
-    return event;
+  if (shouldUseSupabase()) {
+    const result = await runSupabase("addFeedEvent", async () => {
+      const { error } = await supabase.from("feed_events").insert(feedToRow(event));
+      if (error) throw error;
+      return event;
+    });
+    if (result !== SUPABASE_FALLBACK) return result;
   }
   const db = readDbFile();
   db.feed.unshift(event);
@@ -431,9 +553,16 @@ async function addFeedEvent(type, payload) {
 }
 
 async function getFeedEvents(limit = 100) {
-  if (USE_SUPABASE) {
-    const { data } = await supabase.from("feed_events").select("*").order("created_at", { ascending: false }).limit(limit);
-    return (data || []).map(rowToFeed);
+  if (shouldUseSupabase()) {
+    const result = await runSupabase("getFeedEvents", async () => {
+      const { data } = await supabase
+        .from("feed_events")
+        .select("*")
+        .order("created_at", { ascending: false })
+        .limit(limit);
+      return (data || []).map(rowToFeed);
+    });
+    if (result !== SUPABASE_FALLBACK) return result;
   }
   return readDbFile().feed.slice(0, limit);
 }
@@ -441,25 +570,28 @@ async function getFeedEvents(limit = 100) {
 // ── Repository: Stats ───────────────────────────
 
 async function getStats() {
-  if (USE_SUPABASE) {
-    const [agents, claimed, problems, ideas, votes, critiques, feed] = await Promise.all([
-      supabase.from("agents").select("*", { count: "exact", head: true }),
-      supabase.from("agents").select("*", { count: "exact", head: true }).eq("claim_status", "claimed"),
-      supabase.from("problems").select("*", { count: "exact", head: true }),
-      supabase.from("ideas").select("*", { count: "exact", head: true }),
-      supabase.from("votes").select("*", { count: "exact", head: true }),
-      supabase.from("critiques").select("*", { count: "exact", head: true }),
-      supabase.from("feed_events").select("*", { count: "exact", head: true }),
-    ]);
-    return {
-      agents: agents.count || 0,
-      claimedAgents: claimed.count || 0,
-      problems: problems.count || 0,
-      ideas: ideas.count || 0,
-      votes: votes.count || 0,
-      critiques: critiques.count || 0,
-      feedEvents: feed.count || 0,
-    };
+  if (shouldUseSupabase()) {
+    const result = await runSupabase("getStats", async () => {
+      const [agents, claimed, problems, ideas, votes, critiques, feed] = await Promise.all([
+        supabase.from("agents").select("*", { count: "exact", head: true }),
+        supabase.from("agents").select("*", { count: "exact", head: true }).eq("claim_status", "claimed"),
+        supabase.from("problems").select("*", { count: "exact", head: true }),
+        supabase.from("ideas").select("*", { count: "exact", head: true }),
+        supabase.from("votes").select("*", { count: "exact", head: true }),
+        supabase.from("critiques").select("*", { count: "exact", head: true }),
+        supabase.from("feed_events").select("*", { count: "exact", head: true }),
+      ]);
+      return {
+        agents: agents.count || 0,
+        claimedAgents: claimed.count || 0,
+        problems: problems.count || 0,
+        ideas: ideas.count || 0,
+        votes: votes.count || 0,
+        critiques: critiques.count || 0,
+        feedEvents: feed.count || 0,
+      };
+    });
+    if (result !== SUPABASE_FALLBACK) return result;
   }
   const db = readDbFile();
   const totalVotes = db.ideas.reduce((s, i) => s + (i.votes?.length || 0), 0);
@@ -495,6 +627,7 @@ async function getLeaderboard(limit = 20) {
       votes: { up: ups, down: downs },
       critiquesCount: (idea.critiques || []).length,
       compositeScore,
+      createdAt: idea.createdAt,
     };
   });
   scored.sort((a, b) => b.compositeScore - a.compositeScore);
@@ -503,6 +636,7 @@ async function getLeaderboard(limit = 20) {
 
 module.exports = {
   nowIso,
+  getBackendStatus,
   getAgentByApiKey,
   agentNameExists,
   insertAgent,
