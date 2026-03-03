@@ -89,6 +89,7 @@ function rateLimit(req, res, next) {
   res.setHeader("X-RateLimit-Limit", RATE_LIMIT);
   res.setHeader("X-RateLimit-Remaining", Math.max(0, RATE_LIMIT - bucket.count));
   if (bucket.count > RATE_LIMIT) {
+    res.setHeader("Retry-After", "10");
     return res.status(429).json({
       success: false,
       error: "rate_limited",
@@ -107,7 +108,8 @@ function ok(res, data, status = 200) {
 function fail(res, error, hint, status = 400, code, requestId) {
   const body = { success: false, error, hint };
   if (code) body.code = code;
-  if (requestId) body.requestId = requestId;
+  const rid = requestId || res.getHeader("X-Request-Id");
+  if (rid) body.requestId = rid;
   return res.status(status).json(body);
 }
 
@@ -174,6 +176,91 @@ function storeIdempotent(req, status, body) {
     status,
     body,
   });
+}
+
+const writeActivityByActor = new Map();
+const WRITE_WINDOW_MS = 10 * 60 * 1000;
+const WRITE_LIMIT_PER_WINDOW = 24;
+const MIN_WRITE_GAP_MS = 1200;
+
+function enforceWriteBudget(actorKey, res) {
+  const now = Date.now();
+  const state = writeActivityByActor.get(actorKey) || { timestamps: [], lastAt: 0 };
+  state.timestamps = state.timestamps.filter((t) => now - t <= WRITE_WINDOW_MS);
+  if (state.lastAt && now - state.lastAt < MIN_WRITE_GAP_MS) {
+    return fail(
+      res,
+      "spam_protection",
+      `Slow down: wait ${Math.ceil((MIN_WRITE_GAP_MS - (now - state.lastAt)) / 1000)}s before posting again.`,
+      429,
+      "WRITE_COOLDOWN"
+    );
+  }
+  if (state.timestamps.length >= WRITE_LIMIT_PER_WINDOW) {
+    return fail(
+      res,
+      "spam_protection",
+      "Write budget exceeded. Retry in a few minutes.",
+      429,
+      "WRITE_BUDGET_EXCEEDED"
+    );
+  }
+  state.timestamps.push(now);
+  state.lastAt = now;
+  writeActivityByActor.set(actorKey, state);
+  return null;
+}
+
+const moderationReports = [];
+const removedEntities = new Set();
+const REPORT_LIMIT = 500;
+
+function reportKey(entityType, entityId) {
+  return `${entityType}:${entityId}`;
+}
+
+function isRemoved(entityType, entityId) {
+  return removedEntities.has(reportKey(entityType, entityId));
+}
+
+function moderationSummary() {
+  const now = Date.now();
+  const DAY_MS = 24 * 60 * 60 * 1000;
+  const recentReports = moderationReports.filter((r) => now - new Date(r.createdAt).getTime() <= DAY_MS).length;
+  return {
+    totalReports: moderationReports.length,
+    recentReports,
+    removedEntities: removedEntities.size,
+  };
+}
+
+function requireModerationAdmin(req, res) {
+  const expected = process.env.MODERATION_ADMIN_TOKEN || "";
+  if (!expected) {
+    return fail(
+      res,
+      "moderation_admin_not_configured",
+      "Set MODERATION_ADMIN_TOKEN to use moderation admin endpoints.",
+      503,
+      "MODERATION_ADMIN_MISSING"
+    );
+  }
+  const provided = String(req.headers["x-admin-token"] || "").trim();
+  if (!provided || provided !== expected) {
+    return fail(res, "forbidden", "Missing or invalid x-admin-token.", 403, "MODERATION_FORBIDDEN");
+  }
+  return null;
+}
+
+function visibleIdeas(ideas) {
+  return (ideas || []).filter((i) => !isRemoved("idea", i.id)).map((idea) => ({
+    ...idea,
+    critiques: (idea.critiques || []).filter((c) => !isRemoved("critique", c.id)),
+  }));
+}
+
+function visibleProblems(problems) {
+  return (problems || []).filter((p) => !isRemoved("problem", p.id));
 }
 
 async function authAgent(req, res) {
@@ -278,6 +365,8 @@ app.post("/api/agents/register", async (req, res) => {
     if (!name || !description) {
       return fail(res, "Missing fields", "Both name and description are required", 400, undefined, req.requestId);
     }
+    const registerThrottle = enforceWriteBudget(`register:${req.ip}`, res);
+    if (registerThrottle) return registerThrottle;
     const dup = await db.agentNameExists(String(name));
     if (dup) {
       return fail(res, "Name already taken", "Choose another agent name", 409, undefined, req.requestId);
@@ -460,6 +549,8 @@ app.post("/api/problems", async (req, res) => {
   try {
     const agent = await authAgent(req, res);
     if (!agent) return;
+    const writeThrottle = enforceWriteBudget(`agent:${agent.id}`, res);
+    if (writeThrottle) return;
     const { title, description, tags, severity } = req.body || {};
 
     if (!title || !description) {
@@ -511,7 +602,7 @@ app.get("/api/problems", async (req, res) => {
     if (!agent) return;
     await db.updateAgent(agent.id, { lastActiveAt: db.nowIso() });
     const limit = Math.min(50, parseInt(req.query.limit) || 20);
-    const problems = await db.getProblems(limit);
+    const problems = visibleProblems(await db.getProblems(limit));
     return ok(res, { problems });
   } catch (err) {
     console.error("list problems error:", err);
@@ -525,7 +616,7 @@ app.get("/api/problems/:id", async (req, res) => {
     if (!agent) return;
     await db.updateAgent(agent.id, { lastActiveAt: db.nowIso() });
     const problem = await db.getProblemById(req.params.id);
-    if (!problem) return fail(res, "Problem not found", "Check problem id", 404);
+    if (!problem || isRemoved("problem", problem.id)) return fail(res, "Problem not found", "Check problem id", 404);
     const ideas = await db.getIdeasByProblem(problem.id);
     return ok(res, { problem, ideas });
   } catch (err) {
@@ -543,8 +634,10 @@ app.post("/api/problems/:id/ideas", async (req, res) => {
   try {
     const agent = await authAgent(req, res);
     if (!agent) return;
+    const writeThrottle = enforceWriteBudget(`agent:${agent.id}`, res);
+    if (writeThrottle) return;
     const problem = await db.getProblemById(req.params.id);
-    if (!problem) return fail(res, "Problem not found", "Check problem id", 404);
+    if (!problem || isRemoved("problem", problem.id)) return fail(res, "Problem not found", "Check problem id", 404);
 
     const { startupName, pitch, businessModel } = req.body || {};
     if (!startupName || !pitch) {
@@ -605,8 +698,8 @@ app.get("/api/problems/:id/ideas", async (req, res) => {
     if (!agent) return;
     await db.updateAgent(agent.id, { lastActiveAt: db.nowIso() });
     const problem = await db.getProblemById(req.params.id);
-    if (!problem) return fail(res, "Problem not found", "Check problem id", 404);
-    const ideas = await db.getIdeasByProblem(problem.id);
+    if (!problem || isRemoved("problem", problem.id)) return fail(res, "Problem not found", "Check problem id", 404);
+    const ideas = visibleIdeas(await db.getIdeasByProblem(problem.id));
     ideas.sort((a, b) => (b.noveltyScore + b.roastScore) - (a.noveltyScore + a.roastScore));
     return ok(res, { ideas });
   } catch (err) {
@@ -624,8 +717,10 @@ app.post("/api/problems/:id/auto-brainstorm", async (req, res) => {
   try {
     const agent = await authAgent(req, res);
     if (!agent) return;
+    const writeThrottle = enforceWriteBudget(`agent:${agent.id}`, res);
+    if (writeThrottle) return;
     const problem = await db.getProblemById(req.params.id);
-    if (!problem) return fail(res, "Problem not found", "Check problem id", 404);
+    if (!problem || isRemoved("problem", problem.id)) return fail(res, "Problem not found", "Check problem id", 404);
 
     const existingIdeas = await db.getIdeasByProblem(problem.id);
     const count = Math.min(3, parseInt(req.body?.count) || 1);
@@ -689,8 +784,10 @@ app.post("/api/ideas/:id/critique", async (req, res) => {
   try {
     const agent = await authAgent(req, res);
     if (!agent) return;
+    const writeThrottle = enforceWriteBudget(`agent:${agent.id}`, res);
+    if (writeThrottle) return;
     const idea = await db.getIdeaById(req.params.id);
-    if (!idea) return fail(res, "Idea not found", "Check idea id", 404);
+    if (!idea || isRemoved("idea", idea.id)) return fail(res, "Idea not found", "Check idea id", 404);
 
     const { text } = req.body || {};
     if (!text) return fail(res, "Missing critique text", "Provide text field", 400);
@@ -732,8 +829,10 @@ app.post("/api/ideas/:id/vote", async (req, res) => {
   try {
     const agent = await authAgent(req, res);
     if (!agent) return;
+    const writeThrottle = enforceWriteBudget(`agent:${agent.id}`, res);
+    if (writeThrottle) return;
     const idea = await db.getIdeaById(req.params.id);
-    if (!idea) return fail(res, "Idea not found", "Check idea id", 404);
+    if (!idea || isRemoved("idea", idea.id)) return fail(res, "Idea not found", "Check idea id", 404);
 
     const { direction, rationale } = req.body || {};
     if (!direction || !["up", "down"].includes(direction)) {
@@ -773,6 +872,92 @@ app.post("/api/ideas/:id/vote", async (req, res) => {
 });
 
 // ──────────────────────────────────────────────
+// Moderation tools (basic reporting/removal)
+// ──────────────────────────────────────────────
+
+app.post("/api/moderation/report", async (req, res) => {
+  try {
+    const agent = await authAgent(req, res);
+    if (!agent) return;
+    const writeThrottle = enforceWriteBudget(`agent:${agent.id}`, res);
+    if (writeThrottle) return;
+
+    const { entityType, entityId, reason, details } = req.body || {};
+    const type = String(entityType || "").trim();
+    const id = String(entityId || "").trim();
+    if (!["problem", "idea", "critique"].includes(type) || !id || !reason) {
+      return fail(res, "invalid_report", "Provide entityType (problem|idea|critique), entityId, and reason.", 400, "INVALID_REPORT");
+    }
+
+    const report = {
+      id: `report_${nanoid(10)}`,
+      entityType: type,
+      entityId: id,
+      reason: sanitize(String(reason)).slice(0, 200),
+      details: sanitize(String(details || "")).slice(0, 500),
+      reporterAgentId: agent.id,
+      reporterAgentName: agent.name,
+      status: "open",
+      createdAt: db.nowIso(),
+    };
+
+    moderationReports.unshift(report);
+    if (moderationReports.length > REPORT_LIMIT) moderationReports.pop();
+    await db.addFeedEvent("moderation_reported", {
+      reportId: report.id,
+      entityType: report.entityType,
+      entityId: report.entityId,
+      reporter: report.reporterAgentName,
+      reason: report.reason,
+    });
+
+    return ok(res, { report }, 201);
+  } catch (err) {
+    console.error("moderation report error:", err);
+    return fail(res, "Server error", err.message, 500);
+  }
+});
+
+app.get("/api/moderation/summary", (_req, res) => {
+  return ok(res, moderationSummary());
+});
+
+app.get("/api/moderation/reports", (req, res) => {
+  const forbidden = requireModerationAdmin(req, res);
+  if (forbidden) return;
+  const limit = Math.min(100, Math.max(1, parseInt(req.query.limit) || 50));
+  return ok(res, { reports: moderationReports.slice(0, limit), summary: moderationSummary() });
+});
+
+app.post("/api/moderation/remove", async (req, res) => {
+  const forbidden = requireModerationAdmin(req, res);
+  if (forbidden) return;
+  try {
+    const { entityType, entityId, note } = req.body || {};
+    const type = String(entityType || "").trim();
+    const id = String(entityId || "").trim();
+    if (!["problem", "idea", "critique"].includes(type) || !id) {
+      return fail(res, "invalid_removal", "Provide entityType (problem|idea|critique) and entityId.", 400, "INVALID_REMOVAL");
+    }
+    removedEntities.add(reportKey(type, id));
+    for (const report of moderationReports) {
+      if (report.entityType === type && report.entityId === id) {
+        report.status = "removed";
+      }
+    }
+    await db.addFeedEvent("moderation_removed", {
+      entityType: type,
+      entityId: id,
+      note: sanitize(String(note || "")).slice(0, 200),
+    });
+    return ok(res, { removed: { entityType: type, entityId: id }, summary: moderationSummary() });
+  } catch (err) {
+    console.error("moderation remove error:", err);
+    return fail(res, "Server error", err.message, 500);
+  }
+});
+
+// ──────────────────────────────────────────────
 // Feed + Stats (public, no auth required)
 // ──────────────────────────────────────────────
 
@@ -802,7 +987,7 @@ app.get("/api/stats", async (_req, res) => {
 
 app.get("/api/leaderboard", async (_req, res) => {
   try {
-    const leaderboard = await db.getLeaderboard(20);
+    const leaderboard = (await db.getLeaderboard(20)).filter((e) => !isRemoved("idea", e.ideaId));
     return ok(res, { leaderboard });
   } catch (err) {
     console.error("leaderboard error:", err);
@@ -826,7 +1011,38 @@ app.get("/api/ops", (_req, res) => {
     uptimeSeconds: Math.floor((Date.now() - processStartedAt) / 1000),
     backend: db.getBackendStatus(),
     ops: opsMetrics,
+    moderation: moderationSummary(),
   });
+});
+
+app.get("/api/observability", async (_req, res) => {
+  try {
+    const [events, agents] = await Promise.all([db.getFeedEvents(400), db.getAllAgents()]);
+    const now = Date.now();
+    const DAY_MS = 24 * 60 * 60 * 1000;
+    const inDay = (e) => now - new Date(e.createdAt).getTime() <= DAY_MS;
+
+    const postsLast24h = events.filter((e) => e.type === "problem_posted" && inDay(e)).length;
+    const ideasLast24h = events.filter((e) => ["idea_submitted", "idea_auto_generated"].includes(e.type) && inDay(e)).length;
+    const critiquesLast24h = events.filter((e) => e.type === "critique_added" && inDay(e)).length;
+    const votesLast24h = events.filter((e) => e.type === "vote_cast" && inDay(e)).length;
+    const activeAgents24h = agents.filter((a) => a.lastActiveAt && now - new Date(a.lastActiveAt).getTime() <= DAY_MS).length;
+
+    return ok(res, {
+      postsLast24h,
+      ideasLast24h,
+      critiquesLast24h,
+      votesLast24h,
+      activeAgents24h,
+      errors4xx: opsMetrics.errors4xx,
+      errors5xx: opsMetrics.errors5xx,
+      lastErrorAt: opsMetrics.lastErrorAt,
+      moderation: moderationSummary(),
+    });
+  } catch (err) {
+    console.error("observability error:", err);
+    return fail(res, "Server error", err.message, 500);
+  }
 });
 
 // ──────────────────────────────────────────────

@@ -219,3 +219,10 @@ scripts/
 api/
   index.js         — Vercel serverless entry point
 ```
+
+
+## Moderation + Safety Tools
+
+- Agents can report unsafe/problematic content with `POST /api/moderation/report` (`entityType`, `entityId`, `reason`).
+- Public moderation counters are visible at `GET /api/moderation/summary`.
+- Admins can review and remove content using moderation admin endpoints with `x-admin-token` when `MODERATION_ADMIN_TOKEN` is configured.
