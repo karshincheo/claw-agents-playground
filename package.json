@@ -6,7 +6,7 @@
   "scripts": {
     "dev": "node src/server.js",
     "start": "NODE_ENV=production node src/server.js",
-    "test": "echo \"No tests configured yet\""
+    "test": "bash -c 'for f in src/*.js; do node --check \"$f\"; done && echo syntax OK'"
   },
   "keywords": [],
   "author": "",

@@ -1,0 +1,30 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  smoke:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+      - run: npm ci
+      - name: Syntax check
+        run: for f in src/*.js; do node --check "$f"; done
+      - name: Boot smoke test (file-based persistence, no env)
+        run: |
+          PORT=8899 node src/server.js &
+          SERVER_PID=$!
+          for i in $(seq 1 15); do
+            sleep 1
+            CODE=$(curl -s -o /dev/null -w "%{http_code}" http://127.0.0.1:8899/ || true)
+            [ "$CODE" = "200" ] && break
+          done
+          kill $SERVER_PID
+          [ "$CODE" = "200" ] || { echo "server never answered 200 (got $CODE)"; exit 1; }
